@@ -11,32 +11,55 @@ class Backtester {
     this.histService = new HistoricalDataService();
     this.mlModel = mlModelInstance;
     
-    // Indian Market Transaction Costs (Approximate for Equity Delivery)
+    // Indian Market Transaction Costs
     this.costs = {
-      brokerage: 0.0003, // 0.03%
-      stt: 0.001,        // 0.1% Securities Transaction Tax
-      exchangeTxn: 0.0000345, // NSE txn charge
-      gst: 0.18,         // 18% on brokerage + txn charges
-      sebi: 0.000001,    // 0.0001%
-      stampDuty: 0.00015, // 0.015% (Buy side only)
-      slippage: 0.0005   // 0.05% assumed slippage per trade
+      delivery: {
+        brokerage: 0.0003, // 0.03% or Rs 20 (whichever is lower, using simplified % here)
+        stt: 0.001,        // 0.1% on buy and sell
+        exchangeTxn: 0.0000345,
+        gst: 0.18,
+        sebi: 0.000001,
+        stampDuty: 0.00015, // Buy only
+        slippage: 0.0005
+      },
+      intraday: {
+        brokerage: 0.0003, // Max Rs 20, but simplified
+        stt: 0.00025,      // 0.025% on sell side ONLY
+        exchangeTxn: 0.0000345,
+        gst: 0.18,
+        sebi: 0.000001,
+        stampDuty: 0.00003, // 0.003% Buy only
+        slippage: 0.0005
+      }
     };
   }
 
-  calculateCosts(tradeValue, isBuy) {
-    const brokerageAmt = tradeValue * this.costs.brokerage;
-    const sttAmt = tradeValue * this.costs.stt;
-    const txnAmt = tradeValue * this.costs.exchangeTxn;
-    const gstAmt = (brokerageAmt + txnAmt) * this.costs.gst;
-    const sebiAmt = tradeValue * this.costs.sebi;
-    const stampAmt = isBuy ? tradeValue * this.costs.stampDuty : 0;
-    const slippageAmt = tradeValue * this.costs.slippage;
+  calculateCosts(tradeValue, isBuy, mode = 'delivery') {
+    const profile = this.costs[mode] || this.costs.delivery;
+    
+    // Brokerage is max Rs 20
+    const calculatedBrokerage = tradeValue * profile.brokerage;
+    const brokerageAmt = Math.min(calculatedBrokerage, 20);
+    
+    // STT is 0 on buy for intraday
+    let sttAmt = 0;
+    if (mode === 'delivery') {
+      sttAmt = tradeValue * profile.stt;
+    } else if (mode === 'intraday' && !isBuy) {
+      sttAmt = tradeValue * profile.stt;
+    }
+
+    const txnAmt = tradeValue * profile.exchangeTxn;
+    const gstAmt = (brokerageAmt + txnAmt) * profile.gst;
+    const sebiAmt = tradeValue * profile.sebi;
+    const stampAmt = isBuy ? tradeValue * profile.stampDuty : 0;
+    const slippageAmt = tradeValue * profile.slippage;
     
     return brokerageAmt + sttAmt + txnAmt + gstAmt + sebiAmt + stampAmt + slippageAmt;
   }
 
-  async runWalkForwardBacktest(symbol, initialCapital = 100000) {
-    console.log(`\nStarting Walk-Forward Backtest for ${symbol}...`);
+  async runWalkForwardBacktest(symbol, initialCapital = 100000, mode = 'delivery') {
+    console.log(`\nStarting Walk-Forward Backtest for ${symbol} (Mode: ${mode})...`);
     const data = this.histService.getStoredHistoricalData(symbol, 1);
     
     if (!data || data.length < 200) {
@@ -95,7 +118,7 @@ class Backtester {
 
         if (actualQuantity > 0) {
           const tradeValue = actualQuantity * currentPrice;
-          const costs = this.calculateCosts(tradeValue, true);
+          const costs = this.calculateCosts(tradeValue, true, mode);
           
           if (capital >= tradeValue + costs) {
             position = actualQuantity;
@@ -106,7 +129,7 @@ class Backtester {
         }
       } else if (prediction.action === 'SELL' && position > 0) {
         const tradeValue = position * currentPrice;
-        const costs = this.calculateCosts(tradeValue, false);
+        const costs = this.calculateCosts(tradeValue, false, mode);
         
         capital += (tradeValue - costs);
         trades.push({ type: 'SELL', date: currentDay.timestamp, price: currentPrice, qty: position, costs, value: tradeValue, pnl: (currentPrice - entryPrice) * position - costs });
@@ -119,7 +142,7 @@ class Backtester {
     if (position > 0) {
       const finalPrice = data[data.length - 1].close;
       const tradeValue = position * finalPrice;
-      const costs = this.calculateCosts(tradeValue, false);
+      const costs = this.calculateCosts(tradeValue, false, mode);
       capital += (tradeValue - costs);
       trades.push({ type: 'SELL (FORCE CLOSE)', date: data[data.length - 1].timestamp, price: finalPrice, qty: position, costs, value: tradeValue, pnl: (finalPrice - entryPrice) * position - costs });
       position = 0;
@@ -182,23 +205,27 @@ class Backtester {
   }
 }
 
-// Allow running directly from CLI: node backend/src/ml/backtester.js RELIANCE
+// Allow running directly from CLI: node backend/src/ml/backtester.js RELIANCE --mode intraday
 if (require.main === module) {
-  const arg = process.argv[2] || 'RELIANCE';
+  const args = process.argv.slice(2);
+  const symbolArg = args.find(a => !a.startsWith('--')) || 'RELIANCE';
+  const modeIdx = args.indexOf('--mode');
+  const mode = modeIdx !== -1 && args[modeIdx + 1] ? args[modeIdx + 1] : 'delivery';
+  
   const engine = new Backtester();
   const { getDatabase } = require('../services/database');
   
   // Ensure DB connection is established if needed, then run
   getDatabase();
 
-  if (arg === 'batch') {
+  if (symbolArg === 'batch') {
     const symbols = ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']; // Sample batch
-    console.log(`Running batch backtest on ${symbols.length} symbols...`);
+    console.log(`Running batch backtest on ${symbols.length} symbols in ${mode} mode...`);
     
     (async () => {
       const results = [];
       for (const sym of symbols) {
-        const res = await engine.runWalkForwardBacktest(sym);
+        const res = await engine.runWalkForwardBacktest(sym, 100000, mode);
         if (res) results.push(res);
       }
       console.log('\n=== FINAL BATCH RESULTS ===');
@@ -206,7 +233,7 @@ if (require.main === module) {
       process.exit(0);
     })();
   } else {
-    engine.runWalkForwardBacktest(arg).then(() => {
+    engine.runWalkForwardBacktest(symbolArg, 100000, mode).then(() => {
       process.exit(0);
     });
   }

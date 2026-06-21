@@ -81,12 +81,22 @@ class DatabaseService {
       CREATE TABLE IF NOT EXISTS tick_data (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL,
-        token TEXT,
-        timestamp DATETIME NOT NULL,
-        ltp REAL,
-        quantity INTEGER,
-        trade_type TEXT,
-        created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+        price REAL NOT NULL,
+        volume INTEGER,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Fundamental data storage
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS fundamentals (
+        symbol TEXT PRIMARY KEY,
+        trailing_pe REAL,
+        forward_pe REAL,
+        price_to_book REAL,
+        return_on_equity REAL,
+        debt_to_equity REAL,
+        updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
 
@@ -321,7 +331,29 @@ class DatabaseService {
     return stmt.run();
   }
 
-  // ==================== Intraday Data Operations ====================
+  // ==================== Fundamental Operations ====================
+
+  saveFundamentals(fundamentals) {
+    const stmt = this.db.prepare(`
+      INSERT INTO fundamentals (symbol, trailing_pe, forward_pe, price_to_book, return_on_equity, debt_to_equity, updated_at)
+      VALUES (@symbol, @trailing_pe, @forward_pe, @price_to_book, @return_on_equity, @debt_to_equity, datetime('now'))
+      ON CONFLICT(symbol) DO UPDATE SET
+        trailing_pe = excluded.trailing_pe,
+        forward_pe = excluded.forward_pe,
+        price_to_book = excluded.price_to_book,
+        return_on_equity = excluded.return_on_equity,
+        debt_to_equity = excluded.debt_to_equity,
+        updated_at = datetime('now')
+    `);
+    return stmt.run(fundamentals);
+  }
+
+  getFundamentals(symbol) {
+    const stmt = this.db.prepare('SELECT * FROM fundamentals WHERE symbol = ?');
+    return stmt.get(symbol);
+  }
+
+  // ==================== Historical Data Operations ====================
 
   insertIntradayCandle(data) {
     const stmt = this.db.prepare(`

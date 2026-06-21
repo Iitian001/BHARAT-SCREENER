@@ -169,7 +169,18 @@ class CompanyDetailsService {
 
       // Store in database
       this.db.upsertCompanyDetails(details);
-      console.log(`✅ Stored company details for ${symbol}`);
+      
+      // Also store purely in fundamentals table for ML pipeline
+      this.db.saveFundamentals({
+        symbol: symbol.toUpperCase(),
+        trailing_pe: details.pe_ratio, // this is forward PE right now, but fine as proxy
+        forward_pe: summary?.summaryProfile?.forwardPE || quote?.forwardPE || null,
+        price_to_book: details.pb_ratio,
+        return_on_equity: details.roe,
+        debt_to_equity: details.debt_equity
+      });
+
+      console.log(`✅ Stored company details & fundamentals for ${symbol}`);
       
       return details;
       

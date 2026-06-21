@@ -215,6 +215,41 @@ class StockPredictionModel {
     const rewardPercent = Math.abs((targetPrice - currentPrice) / currentPrice) * 100;
     const riskRewardRatio = riskPercent > 0 ? (rewardPercent / riskPercent).toFixed(2) : 0;
 
+    // --- PHASE 2: XGBOOST ENSEMBLE LOGIC ---
+    let xgbProbability = null;
+    let xgbAction = null;
+    try {
+      const axios = require('axios');
+      // Fetch prediction from Python XGBoost Microservice
+      const xgbRes = await axios.post(`http://localhost:8000/predict/${symbol}`, {
+        current_price: currentPrice,
+        current_high: currentData.high || currentPrice,
+        current_low: currentData.low || currentPrice
+      }, { timeout: 2000 });
+      
+      if (xgbRes.data) {
+        xgbProbability = xgbRes.data.probability_up;
+        xgbAction = xgbRes.data.action;
+      }
+    } catch (err) {
+      // Python service might be down or not trained yet. We fall back gracefully.
+      // console.warn(`XGBoost prediction unavailable for ${symbol}`);
+    }
+
+    // Combine models if XGBoost is available
+    if (xgbAction) {
+      // Require consensus!
+      if (action === 'BUY' && xgbAction === 'BUY') {
+        confidence = Math.min(confidence + 10, 99);
+      } else if (action === 'SELL' && xgbAction === 'SELL') {
+        confidence = Math.min(confidence + 10, 99);
+      } else {
+        // Models disagree. Force HOLD and drop confidence.
+        action = 'HOLD';
+        confidence = Math.max(confidence - 20, 20);
+      }
+    }
+
     let finalConfidence = Math.round(confidence);
     
     // Explicit No-Trade Zone constraint
@@ -244,7 +279,7 @@ class StockPredictionModel {
         sma50: indicators.sma50,
         atr: indicators.atr14
       },
-      signals: { technical: technicalSignal, dlPredictedPrice },
+      signals: { technical: technicalSignal, dlPredictedPrice, xgbAction, xgbProbability },
       reasons: [
         ...technicalSignal.reasons,
         cachedModel 
@@ -254,6 +289,10 @@ class StockPredictionModel {
       warnings: [],
       timeHorizon: '1-2 weeks'
     };
+
+    if (xgbAction) {
+      prediction.reasons.push(`XGBoost Model confirms ${xgbAction} with probability ${(xgbProbability * 100).toFixed(1)}%.`);
+    }
 
     return prediction;
   }
