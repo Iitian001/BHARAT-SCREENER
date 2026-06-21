@@ -52,6 +52,10 @@ class Backtester {
     // Start testing from day 100 to allow sufficient history for initial training
     const startIdx = 100;
     
+    // Track daily equity for Sharpe Ratio
+    let dailyEquity = [];
+    const riskFreeRate = 0.06; // 6% Indian Risk Free Rate
+
     // Retrain the model every 30 days to simulate walk-forward walk
     for (let i = startIdx; i < data.length - 1; i++) {
       const currentDay = data[i];
@@ -60,7 +64,7 @@ class Backtester {
       
       // Retrain model periodically (every 30 trading days)
       if (i === startIdx || i % 30 === 0) {
-        console.log(`[Walk-Forward] Retraining model up to ${new Date(currentDay.timestamp).toLocaleDateString()}...`);
+        // console.log(`[Walk-Forward] Retraining model up to ${new Date(currentDay.timestamp).toLocaleDateString()}...`);
         await this.mlModel.trainModelForSymbol(symbol, historicalSlice);
       }
 
@@ -72,6 +76,10 @@ class Backtester {
       });
 
       const currentPrice = currentDay.close;
+
+      // Calculate daily equity (Cash + Value of open position at current day's close)
+      const currentEquity = capital + (position * currentPrice);
+      dailyEquity.push({ date: currentDay.timestamp, equity: currentEquity });
 
       // Simple execution logic based on ML prediction signal
       if (prediction.action === 'BUY' && position === 0) {
@@ -117,33 +125,51 @@ class Backtester {
       position = 0;
     }
 
+    // Include the final day in equity curve
+    dailyEquity.push({ date: data[data.length - 1].timestamp, equity: capital });
+
     // Calculate Metrics
     const totalReturn = ((capital - initialCapital) / initialCapital) * 100;
     const winningTrades = trades.filter(t => t.pnl > 0).length;
     const totalCompletedTrades = trades.filter(t => t.type.includes('SELL')).length;
     const winRate = totalCompletedTrades > 0 ? (winningTrades / totalCompletedTrades) * 100 : 0;
     
+    // Calculate Max Drawdown and Sharpe Ratio
     let peakCapital = initialCapital;
     let maxDrawdown = 0;
-    let runningCapital = initialCapital;
+    let dailyReturns = [];
 
-    // Simulate equity curve
-    for (let t of trades) {
-      if (t.type === 'BUY') {
-        runningCapital -= t.value + t.costs;
-      } else {
-        runningCapital += t.value - t.costs;
-        if (runningCapital > peakCapital) peakCapital = runningCapital;
-        const drawdown = ((peakCapital - runningCapital) / peakCapital) * 100;
-        if (drawdown > maxDrawdown) maxDrawdown = drawdown;
-      }
+    for (let i = 1; i < dailyEquity.length; i++) {
+      const prev = dailyEquity[i - 1].equity;
+      const curr = dailyEquity[i].equity;
+      if (curr > peakCapital) peakCapital = curr;
+      const drawdown = ((peakCapital - curr) / peakCapital) * 100;
+      if (drawdown > maxDrawdown) maxDrawdown = drawdown;
+      
+      const dailyRet = (curr - prev) / prev;
+      dailyReturns.push(dailyRet);
     }
+
+    const avgDailyReturn = dailyReturns.reduce((a, b) => a + b, 0) / dailyReturns.length;
+    const stdDevDailyReturn = Math.sqrt(dailyReturns.reduce((a, b) => a + Math.pow(b - avgDailyReturn, 2), 0) / dailyReturns.length);
+    const annualizedReturn = avgDailyReturn * 252; // 252 trading days
+    const annualizedStdDev = stdDevDailyReturn * Math.sqrt(252);
+    
+    // Sharpe Ratio = (Expected Return - Risk Free Rate) / Portfolio Standard Deviation
+    const sharpeRatio = annualizedStdDev > 0 ? (annualizedReturn - riskFreeRate) / annualizedStdDev : 0;
+
+    // Benchmark Return (Buy & Hold Underlying Stock)
+    const startPrice = data[startIdx].close;
+    const endPrice = data[data.length - 1].close;
+    const benchmarkReturn = ((endPrice - startPrice) / startPrice) * 100;
 
     const report = {
       symbol,
       initialCapital,
       finalCapital: capital,
       totalReturnPct: totalReturn.toFixed(2),
+      benchmarkReturnPct: benchmarkReturn.toFixed(2),
+      sharpeRatio: sharpeRatio.toFixed(2),
       maxDrawdownPct: maxDrawdown.toFixed(2),
       winRatePct: winRate.toFixed(2),
       totalTrades: totalCompletedTrades,
@@ -158,15 +184,32 @@ class Backtester {
 
 // Allow running directly from CLI: node backend/src/ml/backtester.js RELIANCE
 if (require.main === module) {
-  const symbol = process.argv[2] || 'RELIANCE';
+  const arg = process.argv[2] || 'RELIANCE';
   const engine = new Backtester();
   const { getDatabase } = require('../services/database');
   
   // Ensure DB connection is established if needed, then run
   getDatabase();
-  engine.runWalkForwardBacktest(symbol).then(() => {
-    process.exit(0);
-  });
+
+  if (arg === 'batch') {
+    const symbols = ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']; // Sample batch
+    console.log(`Running batch backtest on ${symbols.length} symbols...`);
+    
+    (async () => {
+      const results = [];
+      for (const sym of symbols) {
+        const res = await engine.runWalkForwardBacktest(sym);
+        if (res) results.push(res);
+      }
+      console.log('\n=== FINAL BATCH RESULTS ===');
+      console.table(results);
+      process.exit(0);
+    })();
+  } else {
+    engine.runWalkForwardBacktest(arg).then(() => {
+      process.exit(0);
+    });
+  }
 }
 
 module.exports = Backtester;

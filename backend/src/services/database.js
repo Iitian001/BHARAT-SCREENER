@@ -60,6 +60,22 @@ class DatabaseService {
       )
     `);
 
+    // Paper-Trading Audit Log
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS paper_trades (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        action TEXT NOT NULL,
+        confidence INTEGER NOT NULL,
+        price REAL NOT NULL,
+        target_price REAL,
+        stop_loss REAL,
+        quantity INTEGER NOT NULL,
+        status TEXT DEFAULT 'OPEN',
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Tick-by-tick data storage
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS tick_data (
@@ -472,6 +488,21 @@ class DatabaseService {
   updateStopLoss(id, newStopLoss) {
     const stmt = this.db.prepare(`UPDATE holdings SET stop_loss = ? WHERE id = ?`);
     return stmt.run(newStopLoss, id);
+  }
+
+  // ==================== Paper Trading Operations ====================
+
+  logPaperTrade(trade) {
+    const stmt = this.db.prepare(`
+      INSERT INTO paper_trades (symbol, action, confidence, price, target_price, stop_loss, quantity)
+      VALUES (@symbol, @action, @confidence, @price, @target_price, @stop_loss, @quantity)
+    `);
+    return stmt.run(trade);
+  }
+
+  getPaperTrades() {
+    const stmt = this.db.prepare("SELECT * FROM paper_trades ORDER BY timestamp DESC LIMIT 50");
+    return stmt.all();
   }
 
   // ==================== Statistics ====================

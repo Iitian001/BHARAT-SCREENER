@@ -52,6 +52,21 @@ router.post('/analyze', async (req, res) => {
       symbol
     })
 
+    // Log Paper Trade if model has strong conviction
+    if (prediction.action === 'BUY' || prediction.action === 'SELL') {
+      const { getDatabase } = require('../services/database');
+      const db = getDatabase();
+      db.logPaperTrade({
+        symbol,
+        action: prediction.action,
+        confidence: prediction.confidence,
+        price: prediction.currentPrice,
+        target_price: prediction.targetPrice,
+        stop_loss: prediction.stopLoss,
+        quantity: prediction.suggestedQuantity || 1
+      });
+    }
+
     res.json(prediction)
   } catch (error) {
     console.error('Prediction error:', error)
@@ -223,6 +238,38 @@ router.post('/batch', async (req, res) => {
       success: false,
       error: error.message
     })
+  }
+})
+
+// Run Historical Backtest for a Symbol
+router.get('/backtest/:symbol', async (req, res) => {
+  try {
+    const symbol = req.params.symbol.toUpperCase()
+    const Backtester = require('../ml/backtester')
+    const engine = new Backtester()
+    
+    // Check if we have enough historical data before running backtest
+    const { getDatabase } = require('../services/database')
+    const db = getDatabase()
+    const row = db.db.prepare("SELECT COUNT(*) as count FROM price_history WHERE symbol = ? AND timeframe = '1d'").get(symbol)
+    
+    if (!row || row.count < 200) {
+      return res.json({ 
+        success: false, 
+        error: 'Insufficient historical data for backtesting. Requires at least 200 days.'
+      })
+    }
+
+    const report = await engine.runWalkForwardBacktest(symbol)
+    
+    if (report) {
+      res.json({ success: true, data: report })
+    } else {
+      res.status(400).json({ success: false, error: 'Backtest failed to generate report.' })
+    }
+  } catch (error) {
+    console.error('Backtest API error:', error)
+    res.status(500).json({ success: false, error: error.message })
   }
 })
 

@@ -215,12 +215,19 @@ class StockPredictionModel {
     const rewardPercent = Math.abs((targetPrice - currentPrice) / currentPrice) * 100;
     const riskRewardRatio = riskPercent > 0 ? (rewardPercent / riskPercent).toFixed(2) : 0;
 
+    let finalConfidence = Math.round(confidence);
+    
+    // Explicit No-Trade Zone constraint
+    if (finalConfidence < 65) {
+      action = 'HOLD';
+    }
+
     const prediction = {
       success: true,
       symbol,
       timestamp: new Date().toISOString(),
       action,
-      confidence: Math.round(confidence),
+      confidence: finalConfidence,
       currentPrice,
       targetPrice,
       stopLoss,

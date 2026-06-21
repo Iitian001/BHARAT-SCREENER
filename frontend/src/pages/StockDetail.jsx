@@ -39,6 +39,9 @@ export default function StockDetail() {
   const [chartError, setChartError] = useState(null)
   const [predictionError, setPredictionError] = useState(null)
 
+  const [backtestData, setBacktestData] = useState(null)
+  const [backtestLoading, setBacktestLoading] = useState(true)
+
   // Fetch company details
   const fetchCompany = useCallback(async () => {
     setCompanyLoading(true)
@@ -120,6 +123,19 @@ export default function StockDetail() {
     }
   }, [symbol])
 
+  const fetchBacktest = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/prediction/backtest/${symbol}`)
+      if (!res.ok) throw new Error('Backtest fetch failed')
+      const json = await res.json()
+      if (json.success && json.data) {
+        setBacktestData(json.data)
+      }
+    } catch (err) {
+      console.warn('Backtest fetch warning:', err)
+    }
+  }, [symbol])
+
   // Fetch all data on mount / symbol change
   useEffect(() => {
     if (!symbol) return
@@ -127,7 +143,8 @@ export default function StockDetail() {
     fetchQuote()
     fetchHistorical('1y')
     fetchPrediction()
-  }, [symbol, fetchCompany, fetchQuote, fetchHistorical, fetchPrediction])
+    fetchBacktest()
+  }, [symbol, fetchCompany, fetchQuote, fetchHistorical, fetchPrediction, fetchBacktest])
 
   // Handle timeframe change from chart
   const handleTimeframeChange = useCallback((tf) => {
@@ -222,6 +239,7 @@ export default function StockDetail() {
               prediction={prediction}
               isLoading={predictionLoading}
               currentPrice={currentPrice}
+              backtestData={backtestData}
             />
           )}
         </div>

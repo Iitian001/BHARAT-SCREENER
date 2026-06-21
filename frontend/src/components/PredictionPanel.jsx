@@ -18,7 +18,7 @@ const formatINR = (value) => {
   return `₹${Number(value).toLocaleString('en-IN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`
 }
 
-export default function PredictionPanel({ prediction, isLoading, currentPrice }) {
+export default function PredictionPanel({ prediction, isLoading, currentPrice, backtestData }) {
   const [capital, setCapital] = useState(100000)
 
   // Derived calculations
@@ -158,6 +158,29 @@ export default function PredictionPanel({ prediction, isLoading, currentPrice })
           <span className="confidence-value">{computed.confidence}%</span>
         </div>
       </div>
+
+      {/* Backtest Metrics */}
+      {backtestData && (
+        <div className="backtest-section" style={{ marginTop: '1rem', padding: '1rem', background: 'rgba(255, 255, 255, 0.05)', borderRadius: '8px', borderLeft: '4px solid #8b5cf6' }}>
+          <h4 style={{ margin: '0 0 0.5rem 0', color: '#a78bfa', fontSize: '0.85rem', textTransform: 'uppercase', letterSpacing: '1px' }}>Historical Edge (Backtest)</h4>
+          <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '0.9rem' }}>
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              <span style={{ color: '#9ca3af', fontSize: '0.75rem' }}>Win Rate</span>
+              <span style={{ color: backtestData.winRatePct > 50 ? '#4ade80' : '#f87171', fontWeight: 'bold' }}>{backtestData.winRatePct}%</span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column' }}>
+              <span style={{ color: '#9ca3af', fontSize: '0.75rem' }}>Sharpe Ratio</span>
+              <span style={{ color: backtestData.sharpeRatio > 1 ? '#4ade80' : '#f87171', fontWeight: 'bold' }}>{backtestData.sharpeRatio}</span>
+            </div>
+            <div style={{ display: 'flex', flexDirection: 'column', textAlign: 'right' }}>
+              <span style={{ color: '#9ca3af', fontSize: '0.75rem' }}>vs NIFTY</span>
+              <span style={{ color: (parseFloat(backtestData.totalReturnPct) - parseFloat(backtestData.benchmarkReturnPct)) > 0 ? '#4ade80' : '#f87171', fontWeight: 'bold' }}>
+                {((parseFloat(backtestData.totalReturnPct) - parseFloat(backtestData.benchmarkReturnPct)) > 0 ? '+' : '')}{(parseFloat(backtestData.totalReturnPct) - parseFloat(backtestData.benchmarkReturnPct)).toFixed(2)}%
+              </span>
+            </div>
+          </div>
+        </div>
+      )}
 
       {/* Price Ladder */}
       <div className="price-ladder">
