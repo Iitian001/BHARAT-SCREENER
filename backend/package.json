@@ -1,0 +1,25 @@
+{
+  "name": "stock-screener-backend",
+  "version": "1.0.0",
+  "description": "Real-time stock screener backend with NSE, Yahoo Finance, and Angel One APIs",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "@tensorflow/tfjs": "^4.22.0",
+    "axios": "^1.18.0",
+    "better-sqlite3": "^12.11.1",
+    "cheerio": "^1.2.0",
+    "cors": "^2.8.5",
+    "dotenv": "^16.6.1",
+    "express": "^4.18.2",
+    "node-cron": "^4.4.1",
+    "otplib": "^12.0.1",
+    "socket.io": "^4.7.2",
+    "technicalindicators": "^3.1.0",
+    "ws": "^8.21.0",
+    "yahoo-finance2": "^3.15.3"
+  }
+}

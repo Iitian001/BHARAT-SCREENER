@@ -1,0 +1,268 @@
+.portfolio-page {
+  padding: 32px;
+  max-width: 1200px;
+  margin: 0 auto;
+}
+
+.portfolio-header {
+  margin-bottom: 32px;
+}
+
+.portfolio-header h1 {
+  font-size: 2.5rem;
+  font-weight: 700;
+  margin-bottom: 8px;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+}
+
+.portfolio-header p {
+  color: #94a3b8;
+  font-size: 1.1rem;
+}
+
+.portfolio-layout {
+  display: grid;
+  grid-template-columns: 350px 1fr;
+  gap: 24px;
+}
+
+.portfolio-sidebar {
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 16px;
+  padding: 24px;
+  height: fit-content;
+}
+
+.portfolio-sidebar h2 {
+  font-size: 1.25rem;
+  margin-bottom: 24px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.form-group {
+  margin-bottom: 24px;
+}
+
+.form-group label {
+  display: block;
+  font-size: 0.9rem;
+  color: #94a3b8;
+  margin-bottom: 8px;
+  font-weight: 500;
+}
+
+.budget-input {
+  width: 100%;
+  padding: 12px 16px;
+  background: rgba(15, 23, 42, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  color: #fff;
+  font-size: 1.1rem;
+  font-family: inherit;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.budget-input:focus {
+  border-color: #3b82f6;
+}
+
+.risk-selector, .term-selector {
+  display: flex;
+  gap: 8px;
+}
+
+.toggle-btn {
+  flex: 1;
+  padding: 10px;
+  background: rgba(15, 23, 42, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  border-radius: 8px;
+  color: #94a3b8;
+  cursor: pointer;
+  font-weight: 500;
+  transition: all 0.2s;
+}
+
+.toggle-btn:hover {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.toggle-btn.active {
+  background: rgba(59, 130, 246, 0.2);
+  border-color: #3b82f6;
+  color: #60a5fa;
+}
+
+.generate-btn {
+  width: 100%;
+  padding: 14px;
+  background: linear-gradient(90deg, #3b82f6, #8b5cf6);
+  border: none;
+  border-radius: 8px;
+  color: #fff;
+  font-size: 1.1rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s;
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  gap: 8px;
+}
+
+.generate-btn:hover {
+  opacity: 0.9;
+}
+
+.generate-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.portfolio-main {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+.portfolio-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 400px;
+  background: rgba(30, 41, 59, 0.3);
+  border: 1px dashed rgba(255, 255, 255, 0.1);
+  border-radius: 16px;
+  color: #94a3b8;
+}
+
+.portfolio-empty .icon {
+  font-size: 3rem;
+  margin-bottom: 16px;
+  opacity: 0.5;
+}
+
+.portfolio-summary {
+  display: grid;
+  grid-template-columns: repeat(4, 1fr);
+  gap: 16px;
+}
+
+.summary-card {
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 12px;
+  padding: 16px;
+}
+
+.summary-card .label {
+  font-size: 0.85rem;
+  color: #94a3b8;
+  margin-bottom: 8px;
+}
+
+.summary-card .value {
+  font-size: 1.5rem;
+  font-weight: 700;
+  color: #fff;
+}
+
+.summary-card .value.positive { color: #10b981; }
+
+.portfolio-stocks {
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 16px;
+  padding: 24px;
+}
+
+.portfolio-stocks h3 {
+  margin-bottom: 16px;
+  font-size: 1.2rem;
+}
+
+.stock-list {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.stock-item {
+  display: grid;
+  grid-template-columns: 2fr 1fr 1.5fr 1.5fr 1fr;
+  align-items: center;
+  padding: 16px;
+  background: rgba(15, 23, 42, 0.4);
+  border: 1px solid rgba(255, 255, 255, 0.05);
+  border-radius: 8px;
+  transition: transform 0.2s;
+}
+
+.stock-item:hover {
+  transform: translateX(4px);
+  background: rgba(15, 23, 42, 0.6);
+}
+
+.stock-symbol {
+  font-weight: 600;
+  font-size: 1.1rem;
+  color: #fff;
+}
+
+.stock-allocation {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.allocation-bar {
+  flex: 1;
+  height: 6px;
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.allocation-fill {
+  height: 100%;
+  background: #3b82f6;
+  border-radius: 3px;
+}
+
+.stock-qty, .stock-invested {
+  color: #94a3b8;
+  font-size: 0.95rem;
+}
+
+.stock-qty span, .stock-invested span {
+  color: #fff;
+  font-weight: 500;
+}
+
+.stock-return {
+  text-align: right;
+  font-weight: 600;
+  color: #10b981;
+}
+
+/* Spinner */
+.spinner {
+  width: 24px;
+  height: 24px;
+  border: 3px solid rgba(255,255,255,0.3);
+  border-radius: 50%;
+  border-top-color: #fff;
+  animation: spin 1s ease-in-out infinite;
+}
+
+@keyframes spin {
+  to { transform: rotate(360deg); }
+}
