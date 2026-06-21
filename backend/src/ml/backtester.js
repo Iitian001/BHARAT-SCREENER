@@ -58,13 +58,26 @@ class Backtester {
     return brokerageAmt + sttAmt + txnAmt + gstAmt + sebiAmt + stampAmt + slippageAmt;
   }
 
-  async runWalkForwardBacktest(symbol, initialCapital = 100000, mode = 'delivery') {
-    console.log(`\nStarting Walk-Forward Backtest for ${symbol} (Mode: ${mode})...`);
+  async runWalkForwardBacktest(symbol, initialCapital = 100000, mode = 'delivery', modelType = 'ensemble', params = { conf: 65, returnThresh: 1.5 }) {
+    console.log(`\nStarting Walk-Forward Backtest for ${symbol} (Mode: ${mode}, Model: ${modelType})...`);
     const data = this.histService.getStoredHistoricalData(symbol, 1);
     
     if (!data || data.length < 200) {
       console.log(`Insufficient data for ${symbol}. Need at least 200 days.`);
       return null;
+    }
+
+    // Bulk fetch XGBoost predictions if we are using xgboost or ensemble
+    let xgbHistorical = {};
+    if (modelType === 'xgboost' || modelType === 'ensemble') {
+      try {
+        const axios = require('axios');
+        const res = await axios.get(`http://localhost:8000/historical_predict/${symbol}`);
+        xgbHistorical = res.data;
+      } catch (err) {
+        console.error(`Failed to fetch historical XGBoost data for ${symbol}. Is the python service running?`);
+        return null;
+      }
     }
 
     let capital = initialCapital;
@@ -79,24 +92,40 @@ class Backtester {
     let dailyEquity = [];
     const riskFreeRate = 0.06; // 6% Indian Risk Free Rate
 
-    // Retrain the model every 30 days to simulate walk-forward walk
+    // Retrain the model every 30 days to simulate walk-forward walk (only needed for TFJS LSTM)
     for (let i = startIdx; i < data.length - 1; i++) {
       const currentDay = data[i];
       const nextDay = data[i + 1];
       const historicalSlice = data.slice(0, i + 1); // Data up to today
+      const dateStr = currentDay.timestamp;
       
-      // Retrain model periodically (every 30 trading days)
-      if (i === startIdx || i % 30 === 0) {
-        // console.log(`[Walk-Forward] Retraining model up to ${new Date(currentDay.timestamp).toLocaleDateString()}...`);
-        await this.mlModel.trainModelForSymbol(symbol, historicalSlice);
-      }
+      let prediction = { action: 'HOLD', indicators: {} };
 
-      // Get Prediction using ONLY data available up to today
-      const prediction = await this.mlModel.predictAsync({
-        symbol,
-        historicalData: historicalSlice,
-        currentData: currentDay
-      });
+      if (modelType === 'xgboost') {
+        const xgbPred = xgbHistorical[dateStr];
+        prediction.action = xgbPred ? xgbPred.action : 'HOLD';
+        // Mock ATR for position sizing
+        const indicators = TechnicalIndicators.calculateAll(historicalSlice);
+        prediction.indicators = { atr: indicators.atr14 };
+        
+        // Apply custom sweep thresholds if needed (XGBoost already uses 0.65 internally, but we can override if we passed raw prob. 
+        // For now XGB returns action based on 0.65).
+      } else {
+        // Retrain model periodically (every 30 trading days)
+        if (i === startIdx || i % 30 === 0) {
+          await this.mlModel.trainModelForSymbol(symbol, historicalSlice);
+        }
+
+        // Get Prediction using ONLY data available up to today
+        prediction = await this.mlModel.predictAsync({
+          symbol,
+          historicalData: historicalSlice,
+          currentData: currentDay,
+          modelType,
+          params,
+          xgbAction: xgbHistorical[dateStr] ? xgbHistorical[dateStr].action : null
+        });
+      }
 
       const currentPrice = currentDay.close;
 
@@ -205,38 +234,128 @@ class Backtester {
   }
 }
 
-// Allow running directly from CLI: node backend/src/ml/backtester.js RELIANCE --mode intraday
+// Allow running directly from CLI: node backend/src/ml/backtester.js batch --mode intraday --model ensemble
 if (require.main === module) {
   const args = process.argv.slice(2);
   const symbolArg = args.find(a => !a.startsWith('--')) || 'RELIANCE';
+  
   const modeIdx = args.indexOf('--mode');
   const mode = modeIdx !== -1 && args[modeIdx + 1] ? args[modeIdx + 1] : 'delivery';
   
-  const engine = new Backtester();
-  const { getDatabase } = require('../services/database');
-  
-  // Ensure DB connection is established if needed, then run
-  getDatabase();
+  const modelIdx = args.indexOf('--model');
+  const modelType = modelIdx !== -1 && args[modelIdx + 1] ? args[modelIdx + 1] : 'ensemble';
 
-  if (symbolArg === 'batch') {
-    const symbols = ['RELIANCE', 'TCS', 'INFY', 'HDFCBANK', 'ICICIBANK']; // Sample batch
-    console.log(`Running batch backtest on ${symbols.length} symbols in ${mode} mode...`);
-    
-    (async () => {
-      const results = [];
-      for (const sym of symbols) {
-        const res = await engine.runWalkForwardBacktest(sym, 100000, mode);
-        if (res) results.push(res);
+  const isSweep = args.includes('--sweep');
+
+  const engine = new Backtester();
+  const dbService = require('../services/database');
+  const dbInstance = dbService.getDatabase(); // Initialize DB connection
+
+  (async () => {
+    if (symbolArg === 'batch') {
+      // Get top 50 highly liquid stocks across sectors from SQLite that have enough data
+      const stmt = dbInstance.db.prepare(`
+        SELECT symbol FROM price_history 
+        GROUP BY symbol 
+        HAVING count(timestamp) >= 200 
+        LIMIT 50
+      `);
+      const rows = stmt.all();
+      const symbols = rows.map(r => r.symbol);
+      
+      if (symbols.length === 0) {
+        console.log("No symbols with 200+ days of history found.");
+        process.exit(1);
       }
-      console.log('\n=== FINAL BATCH RESULTS ===');
-      console.table(results);
+
+      console.log(`Running batch backtest on ${symbols.length} symbols in ${mode} mode using ${modelType} model...`);
+      
+      let paramGrid = [{ conf: 65, returnThresh: 1.5 }];
+      if (isSweep) {
+        paramGrid = [];
+        for (const conf of [55, 60, 65, 70, 75]) {
+          for (const returnThresh of [1.0, 1.5, 2.0]) {
+            paramGrid.push({ conf, returnThresh });
+          }
+        }
+        console.log(`Grid Search active: Sweeping ${paramGrid.length} combinations of hyperparameters...`);
+      }
+
+      const gridResults = [];
+
+      for (const params of paramGrid) {
+        console.log(`\n=== Testing Params: Confidence > ${params.conf}, Return > ${params.returnThresh}% ===`);
+        const results = [];
+        
+        for (const sym of symbols) {
+          const res = await engine.runWalkForwardBacktest(sym, 100000, mode, modelType, params);
+          if (res) {
+            results.push(res);
+            // Persist to database
+            dbInstance.saveBacktestRun({
+              symbol: res.symbol,
+              mode,
+              model_type: modelType,
+              initial_capital: res.initialCapital,
+              final_capital: res.finalCapital,
+              total_return_pct: parseFloat(res.totalReturnPct),
+              benchmark_return_pct: parseFloat(res.benchmarkReturnPct),
+              sharpe_ratio: parseFloat(res.sharpeRatio),
+              max_drawdown_pct: parseFloat(res.maxDrawdownPct),
+              win_rate_pct: parseFloat(res.winRatePct),
+              total_trades: res.totalTrades,
+              hyperparameters: JSON.stringify(params)
+            });
+          }
+        }
+        
+        if (results.length > 0) {
+          const avgSharpe = results.reduce((acc, r) => acc + parseFloat(r.sharpeRatio), 0) / results.length;
+          const avgReturn = results.reduce((acc, r) => acc + parseFloat(r.totalReturnPct), 0) / results.length;
+          gridResults.push({
+            conf: params.conf,
+            returnThresh: params.returnThresh,
+            avgSharpe: avgSharpe.toFixed(2),
+            avgReturn: avgReturn.toFixed(2),
+            totalTrades: results.reduce((acc, r) => acc + r.totalTrades, 0)
+          });
+        }
+      }
+
+      if (isSweep) {
+        console.log('\n=== GRID SEARCH RESULTS ===');
+        gridResults.sort((a, b) => parseFloat(b.avgSharpe) - parseFloat(a.avgSharpe)); // Sort by Sharpe descending
+        console.table(gridResults);
+        console.log(`\nBest Parameters: Confidence ${gridResults[0].conf}, Return Thresh ${gridResults[0].returnThresh}%`);
+      } else {
+        console.log('\n=== FINAL BATCH RESULTS ===');
+        // Calculate averages for standard run
+        // (Just display individual for non-sweep, but we can do whatever)
+        console.log(`Average Sharpe: ${gridResults[0].avgSharpe}`);
+      }
+
       process.exit(0);
-    })();
-  } else {
-    engine.runWalkForwardBacktest(symbolArg, 100000, mode).then(() => {
+    } else {
+      const res = await engine.runWalkForwardBacktest(symbolArg, 100000, mode, modelType, { conf: 65, returnThresh: 1.5 });
+      if (res) {
+        dbInstance.saveBacktestRun({
+            symbol: res.symbol,
+            mode,
+            model_type: modelType,
+            initial_capital: res.initialCapital,
+            final_capital: res.finalCapital,
+            total_return_pct: parseFloat(res.totalReturnPct),
+            benchmark_return_pct: parseFloat(res.benchmarkReturnPct),
+            sharpe_ratio: parseFloat(res.sharpeRatio),
+            max_drawdown_pct: parseFloat(res.maxDrawdownPct),
+            win_rate_pct: parseFloat(res.winRatePct),
+            total_trades: res.totalTrades,
+            hyperparameters: JSON.stringify({ conf: 65, returnThresh: 1.5 })
+        });
+      }
       process.exit(0);
-    });
-  }
+    }
+  })();
 }
 
 module.exports = Backtester;

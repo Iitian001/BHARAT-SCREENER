@@ -14,11 +14,21 @@ MODELS_DIR = os.path.join(os.path.dirname(__file__), "models")
 
 os.makedirs(MODELS_DIR, exist_ok=True)
 
+import re
+
+# Sanitize symbol for file paths (prevent path traversal)
+def get_model_path(symbol: str) -> str:
+    # Only allow alphanumeric and some safe characters
+    safe_symbol = re.sub(r'[^a-zA-Z0-9_\-]', '', symbol)
+    if not safe_symbol:
+        safe_symbol = "unknown"
+    return os.path.join(MODELS_DIR, f"{safe_symbol}_xgb.pkl")
+
 # Helper to fetch data
 def fetch_data(symbol: str):
     conn = sqlite3.connect(DB_PATH)
-    query = f"SELECT * FROM price_history WHERE symbol = '{symbol}' ORDER BY timestamp ASC"
-    df = pd.read_sql_query(query, conn)
+    query = "SELECT * FROM price_history WHERE symbol = ? ORDER BY timestamp ASC"
+    df = pd.read_sql_query(query, conn, params=(symbol,))
     conn.close()
     return df
 
@@ -48,8 +58,8 @@ def create_features(df, symbol):
     
     # Fundamental Features
     conn = sqlite3.connect(DB_PATH)
-    fund_query = f"SELECT trailing_pe, price_to_book, return_on_equity, debt_to_equity FROM fundamentals WHERE symbol = '{symbol}'"
-    fund_df = pd.read_sql_query(fund_query, conn)
+    fund_query = "SELECT trailing_pe, price_to_book, return_on_equity, debt_to_equity FROM fundamentals WHERE symbol = ?"
+    fund_df = pd.read_sql_query(fund_query, conn, params=(symbol,))
     conn.close()
 
     if not fund_df.empty:
@@ -99,7 +109,7 @@ def train_model(symbol: str):
     
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     
-    model_path = os.path.join(MODELS_DIR, f"{symbol}_xgb.pkl")
+    model_path = get_model_path(symbol)
     joblib.dump(model, model_path)
     
     return {"message": f"Successfully trained XGBoost for {symbol}"}
@@ -113,26 +123,25 @@ class PredictRequest(BaseModel):
 
 @app.post("/predict/{symbol}")
 def predict(symbol: str, req: PredictRequest):
-    model_path = os.path.join(MODELS_DIR, f"{symbol}_xgb.pkl")
+    model_path = get_model_path(symbol)
     if not os.path.exists(model_path):
         # Trigger train if missing
         train_model(symbol)
-        if not os.path.exists(model_path):
-            raise HTTPException(status_code=500, detail="Failed to create model")
-
+        
+    if not os.path.exists(model_path):
+        raise HTTPException(status_code=500, detail="Model could not be trained")
+        
     model = joblib.load(model_path)
     
-    # Fetch recent history to compute features for the current day
     df = fetch_data(symbol)
     if df.empty:
-        raise HTTPException(status_code=400, detail="No historical data")
-    
-    # Append current day pseudo-tick to create latest features
-    latest_ts = pd.to_datetime('now')
+        raise HTTPException(status_code=404, detail="No historical data found")
+        
+    # Append current data as latest row to calculate features
     new_row = pd.DataFrame([{
+        'timestamp': datetime.now().isoformat(),
         'symbol': symbol,
-        'timestamp': latest_ts,
-        'open': df.iloc[-1]['close'], # proxy
+        'open': req.current_price, # rough approx
         'high': req.current_high,
         'low': req.current_low,
         'close': req.current_price,
@@ -150,6 +159,7 @@ def predict(symbol: str, req: PredictRequest):
     
     prob_up = float(model.predict_proba(X_latest)[0][1])
     
+    # 0.65 threshold for BUY, < 0.35 for SELL, else HOLD
     action = "HOLD"
     if prob_up > 0.65:
         action = "BUY"
@@ -158,10 +168,55 @@ def predict(symbol: str, req: PredictRequest):
         
     return {
         "symbol": symbol,
-        "action": action,
-        "confidence": int(max(prob_up, 1 - prob_up) * 100),
-        "probability_up": prob_up
+        "probability_up": prob_up,
+        "action": action
     }
+
+@app.get("/historical_predict/{symbol}")
+def historical_predict(symbol: str):
+    """
+    Bulk prediction for walk-forward backtesting.
+    Returns the XGBoost signals for all historical dates for a symbol.
+    """
+    model_path = get_model_path(symbol)
+    if not os.path.exists(model_path):
+        train_model(symbol)
+        
+    if not os.path.exists(model_path):
+        raise HTTPException(status_code=500, detail="Model could not be trained")
+        
+    model = joblib.load(model_path)
+    
+    df = fetch_data(symbol)
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No historical data found")
+        
+    df = create_features(df, symbol)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Insufficient data")
+        
+    features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+    X = df[features]
+    
+    probs = model.predict_proba(X)[:, 1]
+    
+    results = {}
+    for (idx, row), prob_up in zip(df.iterrows(), probs):
+        date_str = str(row['timestamp'])
+        prob_up = float(prob_up)
+        
+        action = "HOLD"
+        if prob_up > 0.65:
+            action = "BUY"
+        elif prob_up < 0.35:
+            action = "SELL"
+            
+        results[date_str] = {
+            "probability_up": prob_up,
+            "action": action
+        }
+        
+    return results
 
 if __name__ == "__main__":
     import uvicorn

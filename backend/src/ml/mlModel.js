@@ -135,8 +135,8 @@ class StockPredictionModel {
   /**
    * Analyze stock and generate prediction
    */
-  async predictAsync(params) {
-    const { historicalData, currentData, symbol } = params;
+  async predictAsync(args) {
+    const { historicalData, currentData, symbol, modelType = 'ensemble', params = { conf: 65, returnThresh: 1.5 }, xgbAction: historicalXgbAction } = args;
     
     if (!historicalData || historicalData.length < 50) {
       return { success: false, error: 'Insufficient historical data (need at least 50 candles)', action: 'HOLD', symbol };
@@ -191,12 +191,12 @@ class StockPredictionModel {
       // Combine AI Insight with Technicals
       const predictedChange = ((dlPredictedPrice - currentPrice) / currentPrice) * 100;
       
-      if (predictedChange > 1.5) {
+      if (predictedChange > params.returnThresh) {
         action = technicalSignal.signal === 'BUY' ? 'BUY' : 'HOLD'; // Require consensus
         confidence = Math.min(confidence + 15, 95);
         targetPrice = dlPredictedPrice;
         stopLoss = currentPrice - (dlPredictedPrice - currentPrice) * 0.5; // 1:2 R:R
-      } else if (predictedChange < -1.5) {
+      } else if (predictedChange < -params.returnThresh) {
         action = technicalSignal.signal === 'SELL' ? 'SELL' : 'HOLD';
         confidence = Math.min(confidence + 15, 95);
         targetPrice = dlPredictedPrice;
@@ -217,27 +217,30 @@ class StockPredictionModel {
 
     // --- PHASE 2: XGBOOST ENSEMBLE LOGIC ---
     let xgbProbability = null;
-    let xgbAction = null;
-    try {
-      const axios = require('axios');
-      // Fetch prediction from Python XGBoost Microservice
-      const xgbRes = await axios.post(`http://localhost:8000/predict/${symbol}`, {
-        current_price: currentPrice,
-        current_high: currentData.high || currentPrice,
-        current_low: currentData.low || currentPrice
-      }, { timeout: 2000 });
-      
-      if (xgbRes.data) {
-        xgbProbability = xgbRes.data.probability_up;
-        xgbAction = xgbRes.data.action;
+    let xgbAction = historicalXgbAction || null; // Use bulk prediction if passed
+    
+    if (modelType === 'ensemble' && !xgbAction) {
+      try {
+        const axios = require('axios');
+        // Fetch prediction from Python XGBoost Microservice
+        const xgbRes = await axios.post(`http://localhost:8000/predict/${symbol}`, {
+          current_price: currentPrice,
+          current_high: currentData.high || currentPrice,
+          current_low: currentData.low || currentPrice
+        }, { timeout: 2000 });
+        
+        if (xgbRes.data) {
+          xgbProbability = xgbRes.data.probability_up;
+          xgbAction = xgbRes.data.action;
+        }
+      } catch (err) {
+        // Python service might be down or not trained yet. We fall back gracefully.
+        // console.warn(`XGBoost prediction unavailable for ${symbol}`);
       }
-    } catch (err) {
-      // Python service might be down or not trained yet. We fall back gracefully.
-      // console.warn(`XGBoost prediction unavailable for ${symbol}`);
     }
 
     // Combine models if XGBoost is available
-    if (xgbAction) {
+    if (modelType === 'ensemble' && xgbAction) {
       // Require consensus!
       if (action === 'BUY' && xgbAction === 'BUY') {
         confidence = Math.min(confidence + 10, 99);
@@ -253,7 +256,7 @@ class StockPredictionModel {
     let finalConfidence = Math.round(confidence);
     
     // Explicit No-Trade Zone constraint
-    if (finalConfidence < 65) {
+    if (finalConfidence < params.conf) {
       action = 'HOLD';
     }
 

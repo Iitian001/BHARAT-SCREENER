@@ -100,6 +100,26 @@ class DatabaseService {
       )
     `);
 
+    // Backtest Persistence Storage
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS backtest_runs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        mode TEXT NOT NULL,
+        model_type TEXT NOT NULL,
+        initial_capital REAL,
+        final_capital REAL,
+        total_return_pct REAL,
+        benchmark_return_pct REAL,
+        sharpe_ratio REAL,
+        max_drawdown_pct REAL,
+        win_rate_pct REAL,
+        total_trades INTEGER,
+        hyperparameters TEXT,
+        run_date DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Intraday data (1-minute candles)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS intraday_data (
@@ -354,6 +374,19 @@ class DatabaseService {
   }
 
   // ==================== Historical Data Operations ====================
+
+  saveBacktestRun(run) {
+    const stmt = this.db.prepare(`
+      INSERT INTO backtest_runs (
+        symbol, mode, model_type, initial_capital, final_capital, total_return_pct, 
+        benchmark_return_pct, sharpe_ratio, max_drawdown_pct, win_rate_pct, total_trades, hyperparameters
+      ) VALUES (
+        @symbol, @mode, @model_type, @initial_capital, @final_capital, @total_return_pct, 
+        @benchmark_return_pct, @sharpe_ratio, @max_drawdown_pct, @win_rate_pct, @total_trades, @hyperparameters
+      )
+    `);
+    return stmt.run(run);
+  }
 
   insertIntradayCandle(data) {
     const stmt = this.db.prepare(`
