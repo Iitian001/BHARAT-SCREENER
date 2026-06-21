@@ -1,6 +1,10 @@
 /**
- * Deep Learning Stock Prediction Model (TensorFlow.js)
- * Implements an LSTM neural network for precise price forecasting.
+ * Experimental Pattern Matcher (Toy LSTM)
+ * 
+ * DISCLAIMER: This is a 2-layer LSTM model trained on a small amount of historical data. 
+ * It is NOT a production-ready "Deep Learning Pipeline". It is a toy regression model 
+ * meant for educational paper-trading purposes. It has NO statistical power to predict 
+ * short-term price movements and does NOT constitute financial advice.
  */
 
 const tf = require('@tensorflow/tfjs');
@@ -59,7 +63,7 @@ class StockPredictionModel {
     this.isTraining.set(symbol, true);
 
     try {
-      console.log(`[TFJS] Building and training Multi-Variate Deep Learning model for ${symbol}...`);
+      console.log(`[TFJS] Building and training Pattern Matcher for ${symbol}...`);
       
       // Features: [Open, High, Low, Close, Volume]
       const features = historicalData.map(d => [d.open, d.high, d.low, d.close, d.volume || 0]);
@@ -77,7 +81,7 @@ class StockPredictionModel {
       const tensorX = tf.tensor3d(X, [X.length, windowSize, numFeatures]);
       const tensorY = tf.tensor2d(y, [y.length, 1]);
 
-      // Build Deeper Multi-Variate LSTM Model
+      // Build Toy LSTM Model
       const model = tf.sequential();
       model.add(tf.layers.lstm({
         units: 32, // Reduced from 64 to prevent CPU hang
@@ -102,6 +106,7 @@ class StockPredictionModel {
         epochs: 15, // Reduced from 25 for real-time responsiveness
         batchSize: 32,
         shuffle: true,
+        validationSplit: 0.2, // Held-out 20% validation split to monitor real accuracy
         verbose: 0
       });
 
@@ -128,7 +133,7 @@ class StockPredictionModel {
   }
 
   /**
-   * Analyze stock and generate deep learning prediction
+   * Analyze stock and generate prediction
    */
   async predictAsync(params) {
     const { historicalData, currentData, symbol } = params;
@@ -141,7 +146,7 @@ class StockPredictionModel {
     const indicators = TechnicalIndicators.calculateAll(historicalData);
     const technicalSignal = TechnicalIndicators.generateSignal(indicators, currentPrice);
 
-    // Deep Learning Pipeline
+    // ML Pipeline
     let dlPredictedPrice = null;
     let confidence = technicalSignal.confidence;
     let action = technicalSignal.signal;
@@ -221,8 +226,10 @@ class StockPredictionModel {
       stopLoss,
       riskRewardRatio,
       maxRisk: riskPercent.toFixed(2),
-      suggestedQuantity: Math.floor(2000 / Math.abs(currentPrice - stopLoss)) || 1, // Max risk ₹2000
-      positionValue: (Math.floor(2000 / Math.abs(currentPrice - stopLoss)) || 1) * currentPrice,
+      // ATR-based position sizing (Risking 1% of a hypothetical ₹1,00,000 account)
+      // Risk per share = 1 * ATR. Total risk = ₹1000.
+      suggestedQuantity: indicators.atr14 ? Math.floor(1000 / indicators.atr14) || 1 : 1,
+      positionValue: (indicators.atr14 ? Math.floor(1000 / indicators.atr14) || 1 : 1) * currentPrice,
       indicators: {
         rsi: indicators.rsi14,
         macd: indicators.macd,
@@ -234,8 +241,8 @@ class StockPredictionModel {
       reasons: [
         ...technicalSignal.reasons,
         cachedModel 
-          ? `Deep Learning model predicts price movement to ₹${dlPredictedPrice.toFixed(2)}`
-          : `Deep Learning model is currently training in the background. Using technicals.`
+          ? `LSTM model predicts price movement to ₹${dlPredictedPrice.toFixed(2)}`
+          : `LSTM model is currently training in the background. Using technicals.`
       ],
       warnings: [],
       timeHorizon: '1-2 weeks'
@@ -246,7 +253,7 @@ class StockPredictionModel {
 
   // Wrapper for synchronous compatibility with routes, but ideally route uses predictAsync
   predict(params) {
-    throw new Error('Please use predictAsync for Deep Learning models');
+    throw new Error('Please use predictAsync for LSTM models');
   }
 }
 
