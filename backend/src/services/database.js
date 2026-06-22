@@ -37,10 +37,17 @@ class DatabaseService {
         sector TEXT,
         industry TEXT,
         market_cap REAL,
+        next_earnings_date DATETIME,
         created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
         updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    try {
+      this.db.exec(`ALTER TABLE stocks ADD COLUMN next_earnings_date TEXT`);
+    } catch (e) {
+      // Column likely already exists
+    }
 
     // Historical price data (can store 15+ years)
     this.db.exec(`
@@ -149,6 +156,12 @@ class DatabaseService {
       // Columns likely already exist
     }
 
+    try {
+      this.db.exec(`ALTER TABLE stocks ADD COLUMN next_earnings_date DATETIME`);
+    } catch (e) {
+      // Column likely already exists
+    }
+
     // Intraday data (1-minute candles)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS intraday_data (
@@ -221,6 +234,16 @@ class DatabaseService {
       )
     `);
 
+    // Portfolio Rejections
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS portfolio_rejections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT,
+        reason TEXT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
     // Holdings (Simulated Paper Trading Portfolio)
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS holdings (
@@ -248,6 +271,16 @@ class DatabaseService {
       CREATE INDEX IF NOT EXISTS idx_tick_data_timestamp ON tick_data(timestamp);
       CREATE INDEX IF NOT EXISTS idx_intraday_symbol ON intraday_data(symbol);
       CREATE INDEX IF NOT EXISTS idx_predictions_symbol ON predictions(symbol);
+    `);
+
+    // Portfolio rejections table
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS portfolio_rejections (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        reason TEXT NOT NULL,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
     `);
   }
 
@@ -285,7 +318,6 @@ class DatabaseService {
       SELECT * FROM stocks 
       WHERE symbol LIKE ? OR name LIKE ?
       ORDER BY symbol
-      LIMIT 50
     `);
     const searchPattern = `%${query}%`;
     return stmt.all(searchPattern, searchPattern);
@@ -516,14 +548,13 @@ class DatabaseService {
     });
   }
 
-  getPredictions(symbol, limit = 50) {
+  getPredictions(symbol) {
     const stmt = this.db.prepare(`
       SELECT * FROM predictions 
       WHERE symbol = ?
       ORDER BY created_at DESC
-      LIMIT ?
     `);
-    const rows = stmt.all(symbol, limit);
+    const rows = stmt.all(symbol);
     return rows.map(r => ({
       ...r,
       indicators: JSON.parse(r.indicators || '{}')
@@ -650,6 +681,32 @@ class DatabaseService {
 
   // ==================== Paper Trading Operations ====================
 
+  logPortfolioRejection(symbol, reason) {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO portfolio_rejections (symbol, reason)
+        VALUES (@symbol, @reason)
+      `);
+      return stmt.run({ symbol, reason });
+    } catch (err) {
+      console.error('Error logging portfolio rejection:', err.message);
+      return null;
+    }
+  }
+
+  logPortfolioRejection(symbol, reason) {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO portfolio_rejections (symbol, reason)
+        VALUES (@symbol, @reason)
+      `);
+      return stmt.run({ symbol, reason });
+    } catch (err) {
+      console.error('Error logging portfolio rejection:', err.message);
+      return null;
+    }
+  }
+
   logPaperTrade(trade) {
     const stmt = this.db.prepare(`
       INSERT INTO paper_trades (symbol, action, confidence, price, target_price, stop_loss, quantity)
@@ -659,7 +716,7 @@ class DatabaseService {
   }
 
   getPaperTrades() {
-    const stmt = this.db.prepare("SELECT * FROM paper_trades ORDER BY timestamp DESC LIMIT 50");
+    const stmt = this.db.prepare("SELECT * FROM paper_trades ORDER BY timestamp DESC");
     return stmt.all();
   }
 

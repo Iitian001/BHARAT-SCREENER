@@ -7,6 +7,7 @@ from pydantic import BaseModel
 import os
 import joblib
 from datetime import datetime
+import shap
 
 app = FastAPI(title="Bharat Screener - XGBoost Microservice")
 
@@ -17,13 +18,16 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 
 import re
 
-# Sanitize symbol for file paths (prevent path traversal)
-def get_model_path(symbol: str) -> str:
-    # Only allow alphanumeric and some safe characters
-    safe_symbol = re.sub(r'[^a-zA-Z0-9_\-]', '', symbol)
-    if not safe_symbol:
-        safe_symbol = "unknown"
-    return os.path.join(MODELS_DIR, f"{safe_symbol}_xgb.pkl")
+def get_global_model_path() -> str:
+    return os.path.join(MODELS_DIR, "global_xgb.pkl")
+
+def fetch_all_symbols():
+    conn = sqlite3.connect(DB_PATH)
+    # Get up to 200 symbols to avoid excessive memory usage
+    query = "SELECT DISTINCT symbol FROM price_history LIMIT 200"
+    df = pd.read_sql_query(query, conn)
+    conn.close()
+    return df['symbol'].tolist()
 
 # Helper to fetch data
 def fetch_data(symbol: str):
@@ -133,19 +137,41 @@ def create_features(df, symbol, feature_version='v1'):
     df.dropna(subset=base_features + ['target'], inplace=True)
     return df
 
-@app.post("/train/{symbol}")
-def train_model(symbol: str, feature_version: str = 'v1'):
-    df = fetch_data(symbol)
-    if len(df) < 100:
-        raise HTTPException(status_code=400, detail="Not enough historical data to train")
-
-    df = create_features(df, symbol, feature_version)
+@app.post("/train_global")
+def train_global_model(feature_version: str = 'v2'):
+    symbols = fetch_all_symbols()
+    dfs = []
     
-    features = df.attrs.get('feature_cols', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq'])
-    X = df[features]
+    # Fetch data and create features for all symbols
+    for sym in symbols:
+        try:
+            df = fetch_data(sym)
+            if len(df) >= 100:
+                df = create_features(df, sym, feature_version)
+                if not df.empty:
+                    dfs.append(df)
+        except Exception as e:
+            print(f"Error processing {sym}: {e}")
+            
+    if not dfs:
+        raise HTTPException(status_code=400, detail="Not enough data to train global model")
+        
+    master_df = pd.concat(dfs, ignore_index=True)
+    master_df['timestamp_dt'] = pd.to_datetime(master_df['timestamp'])
+    master_df.sort_values('timestamp_dt', inplace=True)
+    master_df.drop(columns=['timestamp_dt'], inplace=True)
     
-    # Binary classification: Will the stock go up more than 1% in the next 5 days?
-    y = (df['target'] > 0.01).astype(int)
+    features = None
+    for df in dfs:
+        if 'feature_cols' in df.attrs:
+            features = df.attrs['feature_cols']
+            break
+            
+    if not features:
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+        
+    X = master_df[features]
+    y = (master_df['target'] > 0.01).astype(int)
     
     # Time series split (last 20% for validation)
     split_idx = int(len(X) * 0.8)
@@ -162,10 +188,10 @@ def train_model(symbol: str, feature_version: str = 'v1'):
     
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     
-    model_path = get_model_path(symbol)
+    model_path = get_global_model_path()
     joblib.dump({'model': model, 'feature_version': feature_version, 'features': features}, model_path)
     
-    return {"message": f"Successfully trained XGBoost for {symbol} using {feature_version}"}
+    return {"message": f"Successfully trained global XGBoost model using {feature_version}"}
 
 
 class PredictRequest(BaseModel):
@@ -176,10 +202,10 @@ class PredictRequest(BaseModel):
 
 @app.post("/predict/{symbol}")
 def predict(symbol: str, req: PredictRequest):
-    model_path = get_model_path(symbol)
+    model_path = get_global_model_path()
     if not os.path.exists(model_path):
         # Trigger train if missing
-        train_model(symbol)
+        train_global_model()
         
     if not os.path.exists(model_path):
         raise HTTPException(status_code=500, detail="Model could not be trained")
@@ -238,9 +264,9 @@ def historical_predict(symbol: str):
     Bulk prediction for walk-forward backtesting.
     Returns the XGBoost signals for all historical dates for a symbol.
     """
-    model_path = get_model_path(symbol)
+    model_path = get_global_model_path()
     if not os.path.exists(model_path):
-        train_model(symbol)
+        train_global_model()
         
     if not os.path.exists(model_path):
         raise HTTPException(status_code=500, detail="Model could not be trained")
@@ -284,6 +310,71 @@ def historical_predict(symbol: str):
         }
         
     return results
+
+@app.get("/explain/{symbol}")
+def explain(symbol: str):
+    model_path = get_global_model_path()
+    if not os.path.exists(model_path):
+        train_global_model()
+        
+    if not os.path.exists(model_path):
+        raise HTTPException(status_code=500, detail="Model could not be trained")
+        
+    loaded = joblib.load(model_path)
+    if isinstance(loaded, dict) and 'model' in loaded:
+        model = loaded['model']
+        feature_version = loaded.get('feature_version', 'v2')
+        features = loaded.get('features', [])
+    else:
+        model = loaded
+        feature_version = 'v2'
+        features = []
+        
+    if not features:
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+        
+    df = fetch_data(symbol)
+    if df.empty:
+        raise HTTPException(status_code=404, detail="No historical data found")
+        
+    df = create_features(df, symbol, feature_version)
+    if df.empty:
+        raise HTTPException(status_code=400, detail="Insufficient data for feature engineering")
+        
+    X_latest = df.iloc[-1:][features]
+    
+    explainer = shap.TreeExplainer(model)
+    shap_values = explainer.shap_values(X_latest)
+    
+    if isinstance(shap_values, list):
+        sv = shap_values[1][0] if len(shap_values) > 1 else shap_values[0][0]
+    else:
+        # Array shape: (n_samples, n_features) or (n_samples, n_features, n_classes)
+        if len(shap_values.shape) == 3:
+            sv = shap_values[0, :, 1]
+        else:
+            sv = shap_values[0]
+            
+    # Get top 5 features
+    feature_importance = pd.DataFrame({
+        'feature': features,
+        'contribution': sv
+    })
+    
+    feature_importance['abs_contribution'] = feature_importance['contribution'].abs()
+    top_features = feature_importance.sort_values(by='abs_contribution', ascending=False).head(5)
+    
+    result = []
+    for _, row in top_features.iterrows():
+        result.append({
+            "feature": row['feature'],
+            "contribution": float(row['contribution'])
+        })
+        
+    return {
+        "symbol": symbol,
+        "explanations": result
+    }
 
 if __name__ == "__main__":
     import uvicorn

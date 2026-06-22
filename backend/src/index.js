@@ -33,6 +33,8 @@ const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
+const cron = require('node-cron');
+const { exec } = require('child_process');
 
 // ─── Scrip Master & DB ───────────────────────────────────────────────────────
 const scripMaster = require('./services/scripMaster');
@@ -55,6 +57,37 @@ const holdingsRoutes = require('./routes/holdings');
 const app = express();
 app.use(cors());
 app.use(express.json());
+
+// API Auth Middleware
+const API_KEY = process.env.API_KEY || 'BHARAT_QUANT_V1';
+app.use('/api', (req, res, next) => {
+  // Allow health/stats checks without auth
+  if (req.path === '/health' || req.path === '/db/stats') return next();
+  
+  const key = req.headers['x-api-key'] || req.query.api_key;
+  if (key !== API_KEY) {
+    return res.status(401).json({ error: 'Unauthorized: Invalid API Key' });
+  }
+  next();
+});
+
+// Kill Switch Check Middleware
+let killSwitchTriggered = false;
+app.use('/api', (req, res, next) => {
+  if (killSwitchTriggered && (req.path.includes('/prediction') || req.path.includes('/portfolio'))) {
+    return res.status(503).json({ error: 'SYSTEM HALTED: Risk Kill Switch is Active.' });
+  }
+  next();
+});
+
+// ─── Scheduled Tasks (Cron) ─────────────────────────────────────────────────
+cron.schedule('30 15 * * 1-5', () => {
+  console.log('🕒 Running scheduled forward paper trade logging at 3:30 PM...');
+  exec('node src/forward_paper_trade.js', (err, stdout, stderr) => {
+    if (err) console.error('❌ Forward Paper Trade Failed:', err);
+    if (stdout) console.log(stdout);
+  });
+});
 
 // ─── In-memory stock data (simulated fallback) ─────────────────────────────
 const stocks = new Map();

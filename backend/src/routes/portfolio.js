@@ -6,6 +6,8 @@ const mlModel = require('../ml/mlModel');
 const dbService = require('../services/database');
 
 function calculateReturnCorrelation(hist1, hist2, days = 60) {
+  if (!hist1 || !hist2 || hist1.length < 10 || hist2.length < 10) return 0;
+
   const map2 = new Map(hist2.map(h => [h.timestamp, h.close]));
   let ret1 = [], ret2 = [];
   
@@ -24,10 +26,12 @@ function calculateReturnCorrelation(hist1, hist2, days = 60) {
   
   ret1 = ret1.slice(-days);
   ret2 = ret2.slice(-days);
-  if (ret1.length < 10) return 0;
+  if (ret1.length < 10 || ret2.length < 10) return 0;
   
   const mean1 = ret1.reduce((a,b) => a+b, 0) / ret1.length;
   const mean2 = ret2.reduce((a,b) => a+b, 0) / ret2.length;
+  
+  if (isNaN(mean1) || isNaN(mean2)) return 0;
   
   let num = 0, den1 = 0, den2 = 0;
   for(let i=0; i<ret1.length; i++) {
@@ -37,7 +41,10 @@ function calculateReturnCorrelation(hist1, hist2, days = 60) {
     den2 += diff2 * diff2;
   }
   if (den1 === 0 || den2 === 0) return 0;
-  return num / Math.sqrt(den1 * den2);
+  
+  const corr = num / Math.sqrt(den1 * den2);
+  if (isNaN(corr) || corr === undefined) return 0;
+  return corr;
 }
 
 router.post('/generate', async (req, res) => {
@@ -171,7 +178,9 @@ router.post('/generate', async (req, res) => {
       for (const selected of selectedStocks) {
         const corr = calculateReturnCorrelation(stock.historicalData, selected.historicalData, 60);
         if (corr > 0.7) {
-          console.log(`[Portfolio] Rejecting ${stock.symbol} due to high correlation (${corr.toFixed(2)}) with ${selected.symbol}`);
+          const reason = `High correlation (${corr.toFixed(2)}) with ${selected.symbol}`;
+          console.log(`[Portfolio] Rejecting ${stock.symbol} due to ${reason}`);
+          dbInstance.logPortfolioRejection(stock.symbol, reason);
           tooCorrelated = true;
           break;
         }
@@ -183,81 +192,171 @@ router.post('/generate', async (req, res) => {
       const sector = stockInfo && stockInfo.sector ? stockInfo.sector : 'Unknown';
       const currentSectorAlloc = sectorAllocations[sector] || 0;
       if (currentSectorAlloc >= maxSectorBudget) {
-        console.log(`[Portfolio] Rejecting ${stock.symbol}: Sector ${sector} already at ${sectorCapPct}% cap.`);
+        const reason = `Sector ${sector} already at ${sectorCapPct}% cap.`;
+        console.log(`[Portfolio] Rejecting ${stock.symbol}: ${reason}`);
+        dbInstance.logPortfolioRejection(stock.symbol, reason);
         continue;
       }
 
-      const p = Math.min(stock.confidence / 100, 0.95);
-      const q = 1 - p;
-      const riskPct = stock.volatility || 0.02;
-      const rewardPct = stock.expectedReturn / 100;
-      
-      const b = rewardPct / riskPct;
       let kellyFraction = 0;
-      if (b > 0) kellyFraction = p - (q / b);
-      
-      // Half-Kelly
-      kellyFraction = Math.max(0.01, Math.min(kellyFraction / 2, 0.4));
-      
-      const targetAllocation = budget * kellyFraction;
-      let actualAllocation = Math.min(targetAllocation, remainingBudget);
-      
-      // Reduce allocation if it breaches sector cap
-      if (currentSectorAlloc + actualAllocation > maxSectorBudget) {
-        actualAllocation = maxSectorBudget - currentSectorAlloc;
-      }
-      
-      const quantity = Math.floor(actualAllocation / stock.price);
-      
-      if (quantity > 0) {
-        const cost = quantity * stock.price;
-        const profit = cost * rewardPct;
-        const trailingStopLoss = stock.price - (stock.price * riskPct * 2);
-
-        portfolio.push({
-          symbol: stock.symbol,
-          sector: sector,
-          allocationPercent: Math.round((cost / budget) * 100),
-          quantity: quantity,
-          buyPrice: stock.price,
-          totalInvestment: cost,
-          expectedReturnPercent: stock.expectedReturn.toFixed(2),
-          targetPrice: (stock.price * (1 + rewardPct)).toFixed(2),
-          stopLoss: trailingStopLoss.toFixed(2),
-          estimatedProfit: profit,
-          kellyFraction: (kellyFraction * 100).toFixed(1) + '%'
-        });
+      let p, q, riskPct, rewardPct, b;
+      try {
+        p = Math.min(stock.confidence / 100, 0.95);
+        q = 1 - p;
+        riskPct = stock.volatility || 0.02;
+        rewardPct = stock.expectedReturn / 100;
         
-        remainingBudget -= cost;
-        totalExpectedProfit += profit;
-        sectorAllocations[sector] = currentSectorAlloc + cost;
-        selectedStocks.push(stock);
+        b = rewardPct / riskPct;
+        if (b > 0) kellyFraction = p - (q / b);
+        
+        // Half-Kelly
+        kellyFraction = Math.max(0.01, Math.min(kellyFraction / 2, 0.4));
+        if (isNaN(kellyFraction)) kellyFraction = 0.01;
+        
+        const targetAllocation = budget * kellyFraction;
+        let actualAllocation = Math.min(targetAllocation, remainingBudget);
+        
+        // Reduce allocation if it breaches sector cap
+        if (currentSectorAlloc + actualAllocation > maxSectorBudget) {
+          actualAllocation = maxSectorBudget - currentSectorAlloc;
+        }
+        
+        const quantity = Math.floor(actualAllocation / stock.price);
+        
+        if (quantity > 0) {
+          const cost = quantity * stock.price;
+          const profit = cost * rewardPct;
+          const trailingStopLoss = stock.price - (stock.price * riskPct * 2);
+
+          portfolio.push({
+            symbol: stock.symbol,
+            sector: sector,
+            allocationPercent: Math.round((cost / budget) * 100),
+            quantity: quantity,
+            buyPrice: stock.price,
+            totalInvestment: cost,
+            expectedReturnPercent: stock.expectedReturn.toFixed(2),
+            targetPrice: (stock.price * (1 + rewardPct)).toFixed(2),
+            stopLoss: trailingStopLoss.toFixed(2),
+            estimatedProfit: profit,
+            kellyFraction: (kellyFraction * 100).toFixed(1) + '%'
+          });
+          
+          remainingBudget -= cost;
+          totalExpectedProfit += profit;
+          sectorAllocations[sector] = currentSectorAlloc + cost;
+          selectedStocks.push(stock);
+        }
+      } catch (err) {
+        console.error(`[Portfolio] Error processing Kelly allocation for ${stock.symbol}:`, err.message);
+        dbInstance.logPortfolioRejection(stock.symbol, 'Error processing Kelly allocation');
       }
     }
-
-    if (portfolio.length === 0) {
-      return res.json({ success: false, error: 'Budget is too low to buy a diversified basket of top stocks.' });
+        console.warn(`[Portfolio] Error allocating ${stock.symbol}:`, err.message);
+      }
     }
-
-    const overallRiskReward = (totalExpectedProfit / budget) * 100;
 
     console.log(`[Portfolio] ✅ Done! Scanned ${scanned} stocks, selected ${portfolio.length} for portfolio.`);
+    
+    // Calculate aggregate portfolio risk (Volatility & Drawdown)
+    let portfolioVolatility = 0;
+    let expectedDrawdown = 0;
+    
+    if (portfolio.length > 0 && selectedStocks.length > 0) {
+      let minLen = Math.min(...selectedStocks.map(s => s.historicalData.length));
+      minLen = Math.min(minLen, 60); // Use last 60 days
+      
+      const portReturns = new Array(minLen).fill(0);
+      let totalInvested = budget - remainingBudget;
+      
+      for (const stock of selectedStocks) {
+        const portItem = portfolio.find(p => p.symbol === stock.symbol);
+        if (!portItem) continue;
+        const weight = portItem.totalInvestment / totalInvested;
+        
+        const hist = stock.historicalData.slice(-minLen - 1);
+        for (let i = 1; i <= minLen; i++) {
+          if (hist[i] && hist[i-1] && hist[i-1].close > 0) {
+             const ret = (hist[i].close - hist[i-1].close) / hist[i-1].close;
+             portReturns[i-1] += (ret * weight);
+          }
+        }
+      }
+      
+      const meanRet = portReturns.reduce((a, b) => a + b, 0) / minLen;
+      const variance = portReturns.reduce((acc, val) => acc + Math.pow(val - meanRet, 2), 0) / minLen;
+      portfolioVolatility = Math.sqrt(variance) * Math.sqrt(252) * 100;
+      
+      let maxDrawdown = 0;
+      let peak = 1;
+      let currentEq = 1;
+      for (const ret of portReturns) {
+        currentEq *= (1 + ret);
+        if (currentEq > peak) peak = currentEq;
+        const dd = (peak - currentEq) / peak;
+        if (dd > maxDrawdown) maxDrawdown = dd;
+      }
+      expectedDrawdown = maxDrawdown * 100;
+    }
 
-    res.json({
+    return res.json({
       success: true,
       budget,
       stocksScanned: scanned,
       investedAmount: budget - remainingBudget,
       remainingCash: remainingBudget,
-      overallExpectedReturn: overallRiskReward.toFixed(2),
+      overallExpectedReturn: ((totalExpectedProfit / (budget - remainingBudget)) * 100).toFixed(2),
       estimatedProfit: totalExpectedProfit,
+      portfolioVolatility: portfolioVolatility.toFixed(2) + '%',
+      expectedDrawdown: expectedDrawdown.toFixed(2) + '%',
       portfolio
     });
 
   } catch (error) {
-    console.error('Portfolio generation error:', error);
-    res.status(500).json({ success: false, error: error.message });
+    console.error('[Portfolio] Error:', error);
+    res.status(500).json({ success: false, error: 'Failed to generate portfolio' });
   }
 });
+
+// Helper for correlation
+function calculateReturnCorrelation(hist1, hist2, days = 60) {
+  if (!hist1 || !hist2 || hist1.length < days || hist2.length < days) return 0;
+  
+  const map2 = new Map(hist2.map(h => [h.timestamp, h.close]));
+  let ret1 = [], ret2 = [];
+  
+  for (let i = 1; i < hist1.length; i++) {
+    const ts = hist1[i].timestamp;
+    const prevTs = hist1[i-1].timestamp;
+    if (map2.has(ts) && map2.has(prevTs)) {
+      const prev1 = hist1[i-1].close, curr1 = hist1[i].close;
+      const prev2 = map2.get(prevTs), curr2 = map2.get(ts);
+      if (prev1 > 0 && prev2 > 0) {
+        ret1.push((curr1 - prev1) / prev1);
+        ret2.push((curr2 - prev2) / prev2);
+      }
+    }
+  }
+  
+  ret1 = ret1.slice(-days);
+  ret2 = ret2.slice(-days);
+  if (ret1.length < 10) return 0;
+
+  const mean1 = ret1.reduce((a, b) => a + b, 0) / ret1.length;
+  const mean2 = ret2.reduce((a, b) => a + b, 0) / ret2.length;
+  
+  let num = 0, den1 = 0, den2 = 0;
+  for (let i = 0; i < ret1.length; i++) {
+    const d1 = ret1[i] - mean1;
+    const d2 = ret2[i] - mean2;
+    num += (d1 * d2);
+    den1 += (d1 * d1);
+    den2 += (d2 * d2);
+  }
+  
+  if (den1 === 0 || den2 === 0) return 0;
+  const corr = num / Math.sqrt(den1 * den2);
+  return isNaN(corr) ? 0 : corr;
+}
 
 module.exports = router;

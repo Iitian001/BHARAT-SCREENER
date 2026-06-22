@@ -80,6 +80,47 @@ class HistoricalDataService {
     return YAHOO_SYMBOL_MAP[symbol.toUpperCase()] || `${symbol}.NS`;
   }
 
+  sanitizeData(records) {
+    if (!records || records.length === 0) return [];
+    
+    // Sort by timestamp
+    records.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+    // Filter volume = 0
+    let validRecords = records.filter(r => r.volume > 0);
+
+    // Filter gaps > 20%
+    let noGaps = [];
+    for (let i = 0; i < validRecords.length; i++) {
+      const current = validRecords[i];
+      if (noGaps.length > 0) {
+        const previous = noGaps[noGaps.length - 1];
+        const gap = Math.abs(current.close - previous.close) / previous.close;
+        if (gap > 0.20) continue;
+      }
+      noGaps.push(current);
+    }
+
+    // Filter flatlines (5+ days of same price)
+    let finalRecords = [];
+    let i = 0;
+    while (i < noGaps.length) {
+      let j = i + 1;
+      while (j < noGaps.length && noGaps[j].close === noGaps[i].close) {
+        j++;
+      }
+      const count = j - i;
+      if (count < 5) {
+        for (let k = i; k < j; k++) {
+          finalRecords.push(noGaps[k]);
+        }
+      }
+      i = j;
+    }
+
+    return finalRecords;
+  }
+
   /**
    * Fetch and store 15+ years of historical data
    */
@@ -106,7 +147,7 @@ class HistoricalDataService {
       // Transform and store in database using adjClose
       // Note: adjclose adjustment factors change retroactively as new dividends/splits occur, 
       // meaning identical date ranges can produce different numbers run-to-run.
-      const records = result
+      let records = result
         .filter(quote => quote.close != null)
         .map(quote => {
           const adjRatio = quote.adjClose && quote.close ? quote.adjClose / quote.close : 1;
@@ -121,6 +162,8 @@ class HistoricalDataService {
             timeframe: '1d'
           };
         });
+
+      records = this.sanitizeData(records);
 
       if (records.length > 0) {
         this.db.bulkInsertPriceHistory(records);
@@ -141,12 +184,54 @@ class HistoricalDataService {
     }
   }
 
+  sanitizeData(records) {
+    if (!records || records.length === 0) return [];
+    
+    // Sort records chronologically (oldest first)
+    const sorted = [...records].sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+    
+    const sanitized = [];
+    let samePriceCount = 1;
+    let prevClose = null;
+
+    for (let i = 0; i < sorted.length; i++) {
+      const record = sorted[i];
+      
+      // Filter out 0 volume
+      if (record.volume === 0) continue;
+      
+      if (prevClose !== null) {
+        // Price gap > 20%
+        const gap = Math.abs(record.close - prevClose) / prevClose;
+        if (gap > 0.20) {
+          continue; 
+        }
+
+        // Price doesn't move
+        if (record.close === prevClose) {
+          samePriceCount++;
+        } else {
+          samePriceCount = 1;
+        }
+
+        if (samePriceCount >= 5) {
+          continue;
+        }
+      }
+
+      sanitized.push(record);
+      prevClose = record.close;
+    }
+
+    return sanitized;
+  }
+
   /**
    * Fetch historical indices data (NIFTY 50, INDIAVIX)
    */
   async fetchAndStoreIndicesHistory(years = 15) {
-    console.log(`📊 Fetching indices history (^NSEI, ^INDIAVIX)...`);
-    const indices = ['^NSEI', '^INDIAVIX'];
+    console.log(`📊 Fetching indices history...`);
+    const indices = ['^NSEI', '^INDIAVIX', '^CNXIT', '^CNXAUTO', '^CNXBANK', '^CNXPHARMA', '^CNXFMCG'];
     
     const startDate = new Date();
     startDate.setFullYear(startDate.getFullYear() - years);
@@ -163,7 +248,7 @@ class HistoricalDataService {
           const records = result
             .filter(quote => quote.close != null)
             .map(quote => ({
-              symbol: indexSymbol === '^NSEI' ? 'NIFTY50' : 'INDIAVIX',
+              symbol: indexSymbol === '^NSEI' ? 'NIFTY50' : (indexSymbol === '^INDIAVIX' ? 'INDIAVIX' : indexSymbol.replace('^', '')),
               timestamp: new Date(quote.date).toISOString(),
               open: quote.open || quote.close,
               high: quote.high || quote.close,
@@ -420,7 +505,6 @@ class HistoricalDataService {
       FROM price_history 
       WHERE timeframe = '1d' 
       GROUP BY symbol 
-      HAVING cnt >= 50
     `);
     return stmt.all();
   }
