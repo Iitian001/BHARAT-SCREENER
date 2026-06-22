@@ -4,6 +4,7 @@ import Dashboard from './pages/Dashboard'
 import StockDetail from './pages/StockDetail'
 import PortfolioBuilder from './pages/PortfolioBuilder'
 import Holdings from './pages/Holdings'
+import SystemTracking from './pages/SystemTracking'
 
 const WS_URL = 'ws://localhost:8080'
 
@@ -130,6 +131,7 @@ function App() {
           <Route path="/" element={<Dashboard stocks={stocks} indices={indices} marketOpen={marketOpen} connected={connected} priceHistory={priceHistory} prevPrices={prevPrices} alerts={alerts} />} />
           <Route path="/stock/:symbol" element={<StockDetail stocks={stocks} priceHistory={priceHistory} prevPrices={prevPrices} />} />
           <Route path="/portfolio" element={<PortfolioBuilder stocks={stocks} />} />
+          <Route path="/tracking" element={<SystemTracking />} />
           <Route path="/holdings" element={<Holdings />} />
         </Routes>
       </div>

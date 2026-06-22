@@ -201,6 +201,18 @@ export default function PortfolioBuilder() {
                     <div className="value">{portfolio.stocksScanned.toLocaleString()}</div>
                   </div>
                 )}
+                {portfolio.portfolioVolatility && (
+                  <div className="summary-card">
+                    <div className="label">Est. Volatility</div>
+                    <div className="value neutral">{portfolio.portfolioVolatility}</div>
+                  </div>
+                )}
+                {portfolio.expectedDrawdown && (
+                  <div className="summary-card">
+                    <div className="label">Max Expected Drawdown</div>
+                    <div className="value warning">{portfolio.expectedDrawdown}</div>
+                  </div>
+                )}
               </div>
 
               {/* Stock List */}

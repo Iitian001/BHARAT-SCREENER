@@ -188,6 +188,9 @@ export default function Dashboard({ stocks, indices, marketOpen, connected, pric
             <button className="robo-btn" onClick={() => navigate('/holdings')} style={{ backgroundColor: 'rgba(34, 197, 94, 0.1)', color: '#22c55e', border: '1px solid rgba(34, 197, 94, 0.3)' }}>
               <span className="robo-icon">💼</span> My Holdings
             </button>
+            <button className="robo-btn" onClick={() => navigate('/tracking')} style={{ backgroundColor: 'rgba(168, 85, 247, 0.1)', color: '#a855f7', border: '1px solid rgba(168, 85, 247, 0.3)' }}>
+              <span className="robo-icon">🛡️</span> System Tracking
+            </button>
           </div>
         </div>
       </div>
