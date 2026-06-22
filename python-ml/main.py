@@ -6,6 +6,7 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 import os
 import joblib
+from datetime import datetime
 
 app = FastAPI(title="Bharat Screener - XGBoost Microservice")
 
@@ -32,25 +33,18 @@ def fetch_data(symbol: str):
     conn.close()
     return df
 
-# Feature Engineering
-def create_features(df, symbol):
-    if df.empty or len(df) < 50:
+def create_features(df, symbol, feature_version='v1'):
+    if df.empty or len(df) < 60:
         return df
 
-    # Returns
+    # Base Features (v1)
     df['ret_1d'] = df['close'].pct_change(1)
     df['ret_5d'] = df['close'].pct_change(5)
     df['ret_10d'] = df['close'].pct_change(10)
-    
-    # Volatility
     df['vol_10d'] = df['ret_1d'].rolling(10).std()
-    
-    # Simple Moving Averages
     df['sma_20'] = df['close'].rolling(20).mean()
     df['sma_50'] = df['close'].rolling(50).mean()
     df['dist_sma_20'] = (df['close'] - df['sma_20']) / df['sma_20']
-    
-    # High-Low Range
     df['range'] = (df['high'] - df['low']) / df['close']
 
     # Target: 5-day forward return
@@ -58,37 +52,96 @@ def create_features(df, symbol):
     
     # Fundamental Features
     conn = sqlite3.connect(DB_PATH)
-    fund_query = "SELECT trailing_pe, price_to_book, return_on_equity, debt_to_equity FROM fundamentals WHERE symbol = ?"
-    fund_df = pd.read_sql_query(fund_query, conn, params=(symbol,))
-    conn.close()
-
+    fund_df = pd.read_sql_query("SELECT trailing_pe, price_to_book, return_on_equity, debt_to_equity FROM fundamentals WHERE symbol = ?", conn, params=(symbol,))
+    
     if not fund_df.empty:
         df['pe_ratio'] = fund_df.iloc[0]['trailing_pe']
         df['pb_ratio'] = fund_df.iloc[0]['price_to_book']
         df['roe'] = fund_df.iloc[0]['return_on_equity']
         df['debt_eq'] = fund_df.iloc[0]['debt_to_equity']
     else:
-        df['pe_ratio'] = np.nan
-        df['pb_ratio'] = np.nan
-        df['roe'] = np.nan
-        df['debt_eq'] = np.nan
+        for c in ['pe_ratio', 'pb_ratio', 'roe', 'debt_eq']:
+            df[c] = 0
 
-    # Fill NaNs for fundamentals with cross-sectional proxy (here we just use 0 or median, for simplicity 0)
     df[['pe_ratio', 'pb_ratio', 'roe', 'debt_eq']] = df[['pe_ratio', 'pb_ratio', 'roe', 'debt_eq']].fillna(0)
 
-    # Drop NaNs from rolling windows
-    df.dropna(subset=['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'sma_20', 'sma_50', 'dist_sma_20', 'range', 'target'], inplace=True)
+    base_features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+
+    if feature_version == 'v2':
+        # Volatility Regime
+        df['vol_20d'] = df['ret_1d'].rolling(20).std()
+        df['vol_regime'] = df['vol_20d'].rank(pct=True) # 20d volatility percentile
+
+        # Advanced Volume
+        df['vol_change'] = np.where(df['close'] > df['close'].shift(1), df['volume'], np.where(df['close'] < df['close'].shift(1), -df['volume'], 0))
+        df['obv'] = df['vol_change'].cumsum()
+        
+        vol_mean = df['volume'].rolling(20).mean()
+        vol_std = df['volume'].rolling(20).std()
+        df['vol_zscore'] = np.where(vol_std > 0, (df['volume'] - vol_mean) / vol_std, 0)
+
+        # Market Context & Relative Strength
+        nifty = pd.read_sql_query("SELECT timestamp, close as n_close FROM indices_history WHERE symbol = 'NIFTY50'", conn)
+        vix = pd.read_sql_query("SELECT timestamp, close as v_close FROM indices_history WHERE symbol = 'INDIAVIX'", conn)
+        
+        if not nifty.empty and not vix.empty:
+            # Format timestamp for merging
+            df['date_only'] = pd.to_datetime(df['timestamp']).dt.date
+            nifty['date_only'] = pd.to_datetime(nifty['timestamp']).dt.date
+            vix['date_only'] = pd.to_datetime(vix['timestamp']).dt.date
+
+            nifty['n_ret_5d'] = nifty['n_close'].pct_change(5)
+            nifty['n_ret_20d'] = nifty['n_close'].pct_change(20)
+            nifty['n_ret_60d'] = nifty['n_close'].pct_change(60)
+            nifty['n_sma_20'] = nifty['n_close'].rolling(20).mean()
+            nifty['n_trend'] = (nifty['n_close'] - nifty['n_sma_20']) / nifty['n_sma_20']
+
+            df = pd.merge(df, nifty[['date_only', 'n_trend', 'n_ret_5d', 'n_ret_20d', 'n_ret_60d']], on='date_only', how='left')
+            df = pd.merge(df, vix[['date_only', 'v_close']], on='date_only', how='left')
+
+            # Relative Strength
+            df['ret_20d'] = df['close'].pct_change(20)
+            df['ret_60d'] = df['close'].pct_change(60)
+            df['rs_5d'] = df['ret_5d'] - df['n_ret_5d']
+            df['rs_20d'] = df['ret_20d'] - df['n_ret_20d']
+            df['rs_60d'] = df['ret_60d'] - df['n_ret_60d']
+
+            # Forward fill market data if missing
+            market_cols = ['n_trend', 'v_close', 'rs_5d', 'rs_20d', 'rs_60d']
+            df[market_cols] = df[market_cols].ffill().fillna(0)
+            
+            df.drop(columns=['date_only'], inplace=True)
+        else:
+            df['vol_regime'] = 0
+            df['obv'] = 0
+            df['vol_zscore'] = 0
+            df['n_trend'] = 0
+            df['v_close'] = 0
+            df['rs_5d'] = 0
+            df['rs_20d'] = 0
+            df['rs_60d'] = 0
+
+        v2_features = ['vol_regime', 'vol_zscore', 'n_trend', 'v_close', 'rs_5d', 'rs_20d', 'rs_60d']
+        base_features.extend(v2_features)
+
+    conn.close()
+    
+    # Store used features list for the model
+    df.attrs['feature_cols'] = base_features
+
+    # Drop NaNs
+    df.dropna(subset=base_features + ['target'], inplace=True)
     return df
 
 @app.post("/train/{symbol}")
-def train_model(symbol: str):
+def train_model(symbol: str, feature_version: str = 'v1'):
     df = fetch_data(symbol)
     if len(df) < 100:
         raise HTTPException(status_code=400, detail="Not enough historical data to train")
 
-    df = create_features(df, symbol)
+    df = create_features(df, symbol, feature_version)
     
-    features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+    features = df.attrs.get('feature_cols', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq'])
     X = df[features]
     
     # Binary classification: Will the stock go up more than 1% in the next 5 days?
@@ -110,9 +163,9 @@ def train_model(symbol: str):
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     
     model_path = get_model_path(symbol)
-    joblib.dump(model, model_path)
+    joblib.dump({'model': model, 'feature_version': feature_version, 'features': features}, model_path)
     
-    return {"message": f"Successfully trained XGBoost for {symbol}"}
+    return {"message": f"Successfully trained XGBoost for {symbol} using {feature_version}"}
 
 
 class PredictRequest(BaseModel):
@@ -131,7 +184,15 @@ def predict(symbol: str, req: PredictRequest):
     if not os.path.exists(model_path):
         raise HTTPException(status_code=500, detail="Model could not be trained")
         
-    model = joblib.load(model_path)
+    loaded = joblib.load(model_path)
+    if isinstance(loaded, dict) and 'model' in loaded:
+        model = loaded['model']
+        feature_version = loaded.get('feature_version', 'v1')
+        features = loaded.get('features', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq'])
+    else:
+        model = loaded
+        feature_version = 'v1'
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
     
     df = fetch_data(symbol)
     if df.empty:
@@ -149,12 +210,11 @@ def predict(symbol: str, req: PredictRequest):
     }])
     
     df = pd.concat([df, new_row], ignore_index=True)
-    df = create_features(df, symbol)
+    df = create_features(df, symbol, feature_version)
     
     if df.empty:
         raise HTTPException(status_code=400, detail="Insufficient data for feature engineering")
     
-    features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
     X_latest = df.iloc[-1:][features]
     
     prob_up = float(model.predict_proba(X_latest)[0][1])
@@ -185,17 +245,24 @@ def historical_predict(symbol: str):
     if not os.path.exists(model_path):
         raise HTTPException(status_code=500, detail="Model could not be trained")
         
-    model = joblib.load(model_path)
+    loaded = joblib.load(model_path)
+    if isinstance(loaded, dict) and 'model' in loaded:
+        model = loaded['model']
+        feature_version = loaded.get('feature_version', 'v1')
+        features = loaded.get('features', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq'])
+    else:
+        model = loaded
+        feature_version = 'v1'
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
     
     df = fetch_data(symbol)
     if df.empty:
         raise HTTPException(status_code=404, detail="No historical data found")
         
-    df = create_features(df, symbol)
+    df = create_features(df, symbol, feature_version)
     if df.empty:
         raise HTTPException(status_code=400, detail="Insufficient data")
         
-    features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
     X = df[features]
     
     probs = model.predict_proba(X)[:, 1]

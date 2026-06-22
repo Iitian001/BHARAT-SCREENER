@@ -72,7 +72,25 @@ class DatabaseService {
         stop_loss REAL,
         quantity INTEGER NOT NULL,
         status TEXT DEFAULT 'OPEN',
+        actual_outcome_price REAL,
+        resolved_at DATETIME,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Indices history (NIFTY 50, INDIAVIX)
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS indices_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        symbol TEXT NOT NULL,
+        timestamp DATETIME NOT NULL,
+        open REAL,
+        high REAL,
+        low REAL,
+        close REAL,
+        volume INTEGER,
+        created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(symbol, timestamp)
       )
     `);
 
@@ -116,9 +134,20 @@ class DatabaseService {
         win_rate_pct REAL,
         total_trades INTEGER,
         hyperparameters TEXT,
+        feature_version TEXT DEFAULT 'v1',
+        is_survivorship_biased BOOLEAN DEFAULT 1,
+        holdout_type TEXT DEFAULT 'none',
         run_date DATETIME DEFAULT CURRENT_TIMESTAMP
       )
     `);
+
+    try {
+      this.db.exec(`ALTER TABLE backtest_runs ADD COLUMN feature_version TEXT DEFAULT 'v1'`);
+      this.db.exec(`ALTER TABLE backtest_runs ADD COLUMN is_survivorship_biased BOOLEAN DEFAULT 1`);
+      this.db.exec(`ALTER TABLE backtest_runs ADD COLUMN holdout_type TEXT DEFAULT 'none'`);
+    } catch (e) {
+      // Columns likely already exist
+    }
 
     // Intraday data (1-minute candles)
     this.db.exec(`
@@ -375,17 +404,81 @@ class DatabaseService {
 
   // ==================== Historical Data Operations ====================
 
-  saveBacktestRun(run) {
-    const stmt = this.db.prepare(`
-      INSERT INTO backtest_runs (
-        symbol, mode, model_type, initial_capital, final_capital, total_return_pct, 
-        benchmark_return_pct, sharpe_ratio, max_drawdown_pct, win_rate_pct, total_trades, hyperparameters
-      ) VALUES (
-        @symbol, @mode, @model_type, @initial_capital, @final_capital, @total_return_pct, 
-        @benchmark_return_pct, @sharpe_ratio, @max_drawdown_pct, @win_rate_pct, @total_trades, @hyperparameters
-      )
-    `);
-    return stmt.run(run);
+  saveBacktestRun(data) {
+    try {
+      const stmt = this.db.prepare(`
+        INSERT INTO backtest_runs (
+          symbol, mode, model_type, initial_capital, final_capital,
+          total_return_pct, benchmark_return_pct, sharpe_ratio, max_drawdown_pct,
+          win_rate_pct, total_trades, hyperparameters, feature_version, is_survivorship_biased, holdout_type
+        ) VALUES (
+          @symbol, @mode, @model_type, @initial_capital, @final_capital,
+          @total_return_pct, @benchmark_return_pct, @sharpe_ratio, @max_drawdown_pct,
+          @win_rate_pct, @total_trades, @hyperparameters, @feature_version, @is_survivorship_biased, @holdout_type
+        )
+      `);
+      
+      const info = stmt.run({
+        symbol: data.symbol,
+        mode: data.mode,
+        model_type: data.model_type,
+        initial_capital: data.initial_capital,
+        final_capital: data.final_capital,
+        total_return_pct: data.total_return_pct,
+        benchmark_return_pct: data.benchmark_return_pct,
+        sharpe_ratio: data.sharpe_ratio,
+        max_drawdown_pct: data.max_drawdown_pct,
+        win_rate_pct: data.win_rate_pct,
+        total_trades: data.total_trades,
+        hyperparameters: data.hyperparameters || '{}',
+        feature_version: data.feature_version || 'v1',
+        is_survivorship_biased: data.is_survivorship_biased !== undefined ? data.is_survivorship_biased : 1,
+        holdout_type: data.holdout_type || 'none'
+      });
+      return info.lastInsertRowid;
+    } catch (err) {
+      console.error('Error saving backtest run:', err.message);
+      return null;
+    }
+  }
+
+  saveIndexHistory(symbol, data) {
+    try {
+      const insert = this.db.prepare(`
+        INSERT OR IGNORE INTO indices_history (
+          symbol, timestamp, open, high, low, close, volume
+        ) VALUES (
+          @symbol, @timestamp, @open, @high, @low, @close, @volume
+        )
+      `);
+      
+      const insertMany = this.db.transaction((records) => {
+        let inserted = 0;
+        for (const record of records) {
+          const info = insert.run(record);
+          if (info.changes > 0) inserted++;
+        }
+        return inserted;
+      });
+      
+      return insertMany(data);
+    } catch (err) {
+      console.error(`Error saving index history for ${symbol}:`, err.message);
+      return 0;
+    }
+  }
+
+  getIndexHistory(symbol, params = {}) {
+    let query = `SELECT * FROM indices_history WHERE symbol = ?`;
+    const queryParams = [symbol];
+    
+    if (params.days) {
+      query += ` AND datetime(timestamp) >= datetime('now', '-' || ? || ' days')`;
+      queryParams.push(params.days);
+    }
+    
+    query += ` ORDER BY datetime(timestamp) ASC`;
+    return this.db.prepare(query).all(...queryParams);
   }
 
   insertIntradayCandle(data) {

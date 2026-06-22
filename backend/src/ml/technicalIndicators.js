@@ -50,6 +50,8 @@ class TechnicalIndicators {
       
       // Volume Analysis
       volumeSMA20: this.SMA(volumes, 20),
+      obv: this.OBV(closes, volumes),
+      volumeZScore: this.VolumeZScore(volumes, 20),
       
       // Support & Resistance (using recent highs/lows)
       supportResistance: this.calculateSupportResistance(highs, lows, closes)
@@ -204,6 +206,34 @@ class TechnicalIndicators {
     } catch (e) {
       return null
     }
+  }
+
+  /**
+   * On-Balance Volume (OBV)
+   */
+  static OBV(closes, volumes) {
+    if (!closes || !volumes || closes.length < 2) return 0;
+    let obv = 0;
+    for (let i = 1; i < closes.length; i++) {
+      if (closes[i] > closes[i - 1]) obv += volumes[i];
+      else if (closes[i] < closes[i - 1]) obv -= volumes[i];
+    }
+    return obv;
+  }
+
+  /**
+   * Volume Z-Score (Spike Detection)
+   */
+  static VolumeZScore(volumes, period = 20) {
+    if (!volumes || volumes.length < period) return 0;
+    const recent = volumes.slice(-period);
+    const current = recent[recent.length - 1];
+    
+    const mean = recent.reduce((a, b) => a + b, 0) / period;
+    const variance = recent.reduce((a, b) => a + Math.pow(b - mean, 2), 0) / period;
+    const stdDev = Math.sqrt(variance);
+    
+    return stdDev > 0 ? (current - mean) / stdDev : 0;
   }
 
   /**

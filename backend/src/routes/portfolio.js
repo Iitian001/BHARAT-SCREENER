@@ -3,6 +3,42 @@ const router = express.Router();
 const HistoricalDataService = require('../services/historicalDataService');
 const TechnicalIndicators = require('../ml/technicalIndicators');
 const mlModel = require('../ml/mlModel');
+const dbService = require('../services/database');
+
+function calculateReturnCorrelation(hist1, hist2, days = 60) {
+  const map2 = new Map(hist2.map(h => [h.timestamp, h.close]));
+  let ret1 = [], ret2 = [];
+  
+  for (let i = 1; i < hist1.length; i++) {
+    const ts = hist1[i].timestamp;
+    const prevTs = hist1[i-1].timestamp;
+    if (map2.has(ts) && map2.has(prevTs)) {
+      const prev1 = hist1[i-1].close, curr1 = hist1[i].close;
+      const prev2 = map2.get(prevTs), curr2 = map2.get(ts);
+      if (prev1 > 0 && prev2 > 0) {
+        ret1.push((curr1 - prev1) / prev1);
+        ret2.push((curr2 - prev2) / prev2);
+      }
+    }
+  }
+  
+  ret1 = ret1.slice(-days);
+  ret2 = ret2.slice(-days);
+  if (ret1.length < 10) return 0;
+  
+  const mean1 = ret1.reduce((a,b) => a+b, 0) / ret1.length;
+  const mean2 = ret2.reduce((a,b) => a+b, 0) / ret2.length;
+  
+  let num = 0, den1 = 0, den2 = 0;
+  for(let i=0; i<ret1.length; i++) {
+    const diff1 = ret1[i] - mean1, diff2 = ret2[i] - mean2;
+    num += (diff1 * diff2);
+    den1 += diff1 * diff1;
+    den2 += diff2 * diff2;
+  }
+  if (den1 === 0 || den2 === 0) return 0;
+  return num / Math.sqrt(den1 * den2);
+}
 
 router.post('/generate', async (req, res) => {
   try {
@@ -113,64 +149,89 @@ router.post('/generate', async (req, res) => {
       topCandidates.sort((a, b) => (b.expectedReturn / (b.volatility || 0.01)) - (a.expectedReturn / (a.volatility || 0.01)));
     }
 
-    // PHASE 5: Allocate Budget Using Kelly Criterion
+    // PHASE 5: Allocate Budget Using Kelly Criterion, Sector Caps, and Correlation check
     const portfolio = [];
     let remainingBudget = budget;
     let totalExpectedProfit = 0;
     
-    // Sort by confidence/expected return to allocate to the best setups first
-    topCandidates.sort((a, b) => b.confidence - a.confidence);
+    const dbInstance = dbService.getDatabase();
+    const sectorCapPct = req.body.sectorCap || 25;
+    const maxSectorBudget = budget * (sectorCapPct / 100);
+    const sectorAllocations = {};
+    const selectedStocks = [];
+    
+    // Global ranking: Sharpe contribution (Expected Return / Volatility)
+    topCandidates.sort((a, b) => (b.expectedReturn / (b.volatility || 0.01)) - (a.expectedReturn / (a.volatility || 0.01)));
 
     for (const stock of topCandidates) {
       if (remainingBudget <= 100) break; // Minimum budget threshold
 
-      // Kelly Criterion: f* = p - (q / b)
-      // p = probability of winning (confidence)
-      // q = probability of losing (1 - p)
-      // b = Reward / Risk ratio
-      
-      const p = Math.min(stock.confidence / 100, 0.95); // Max 95% confidence
+      // Correlation Check (> 0.7 reject)
+      let tooCorrelated = false;
+      for (const selected of selectedStocks) {
+        const corr = calculateReturnCorrelation(stock.historicalData, selected.historicalData, 60);
+        if (corr > 0.7) {
+          console.log(`[Portfolio] Rejecting ${stock.symbol} due to high correlation (${corr.toFixed(2)}) with ${selected.symbol}`);
+          tooCorrelated = true;
+          break;
+        }
+      }
+      if (tooCorrelated) continue;
+
+      // Sector Cap Check
+      const stockInfo = dbInstance.db.prepare('SELECT sector FROM stocks WHERE symbol = ?').get(stock.symbol);
+      const sector = stockInfo && stockInfo.sector ? stockInfo.sector : 'Unknown';
+      const currentSectorAlloc = sectorAllocations[sector] || 0;
+      if (currentSectorAlloc >= maxSectorBudget) {
+        console.log(`[Portfolio] Rejecting ${stock.symbol}: Sector ${sector} already at ${sectorCapPct}% cap.`);
+        continue;
+      }
+
+      const p = Math.min(stock.confidence / 100, 0.95);
       const q = 1 - p;
-      const riskPct = stock.volatility || 0.02; // Default 2% risk
+      const riskPct = stock.volatility || 0.02;
       const rewardPct = stock.expectedReturn / 100;
       
       const b = rewardPct / riskPct;
-      
       let kellyFraction = 0;
-      if (b > 0) {
-        kellyFraction = p - (q / b);
-      }
+      if (b > 0) kellyFraction = p - (q / b);
       
-      // Half-Kelly for safety
-      kellyFraction = Math.max(0.01, Math.min(kellyFraction / 2, 0.4)); // Max 40% per stock
+      // Half-Kelly
+      kellyFraction = Math.max(0.01, Math.min(kellyFraction / 2, 0.4));
       
       const targetAllocation = budget * kellyFraction;
-      const actualAllocation = Math.min(targetAllocation, remainingBudget);
+      let actualAllocation = Math.min(targetAllocation, remainingBudget);
+      
+      // Reduce allocation if it breaches sector cap
+      if (currentSectorAlloc + actualAllocation > maxSectorBudget) {
+        actualAllocation = maxSectorBudget - currentSectorAlloc;
+      }
       
       const quantity = Math.floor(actualAllocation / stock.price);
       
       if (quantity > 0) {
         const cost = quantity * stock.price;
         const profit = cost * rewardPct;
-        
-        // Trailing Stop Loss (2x ATR below current price)
         const trailingStopLoss = stock.price - (stock.price * riskPct * 2);
 
         portfolio.push({
           symbol: stock.symbol,
+          sector: sector,
           allocationPercent: Math.round((cost / budget) * 100),
           quantity: quantity,
           buyPrice: stock.price,
           totalInvestment: cost,
           expectedReturnPercent: stock.expectedReturn.toFixed(2),
           targetPrice: (stock.price * (1 + rewardPct)).toFixed(2),
-          stopLoss: trailingStopLoss.toFixed(2), // New: Trailing Stop Loss
+          stopLoss: trailingStopLoss.toFixed(2),
           estimatedProfit: profit,
           kellyFraction: (kellyFraction * 100).toFixed(1) + '%'
         });
         
         remainingBudget -= cost;
         totalExpectedProfit += profit;
+        sectorAllocations[sector] = currentSectorAlloc + cost;
+        selectedStocks.push(stock);
       }
     }
 

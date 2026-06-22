@@ -58,12 +58,26 @@ class Backtester {
     return brokerageAmt + sttAmt + txnAmt + gstAmt + sebiAmt + stampAmt + slippageAmt;
   }
 
-  async runWalkForwardBacktest(symbol, initialCapital = 100000, mode = 'delivery', modelType = 'ensemble', params = { conf: 65, returnThresh: 1.5 }) {
-    console.log(`\nStarting Walk-Forward Backtest for ${symbol} (Mode: ${mode}, Model: ${modelType})...`);
-    const data = this.histService.getStoredHistoricalData(symbol, 1);
+  async runWalkForwardBacktest(symbol, initialCapital = 100000, mode = 'delivery', modelType = 'ensemble', params = { conf: 65, returnThresh: 1.5 }, timeWindow = 'all', holdoutDate = null) {
+    console.log(`\nStarting Walk-Forward Backtest for ${symbol} (Mode: ${mode}, Model: ${modelType}, TimeWindow: ${timeWindow})...`);
+    let data = this.histService.getStoredHistoricalData(symbol, 1);
     
     if (!data || data.length < 200) {
       console.log(`Insufficient data for ${symbol}. Need at least 200 days.`);
+      return null;
+    }
+
+    // Apply time-based holdout filter if specified
+    if (holdoutDate) {
+      if (timeWindow === 'tuning') {
+        data = data.filter(d => new Date(d.timestamp) < new Date(holdoutDate));
+      } else if (timeWindow === 'holdout') {
+        data = data.filter(d => new Date(d.timestamp) >= new Date(holdoutDate));
+      }
+    }
+
+    if (data.length < 50) {
+      console.log(`Insufficient data for ${symbol} in window ${timeWindow}.`);
       return null;
     }
 
@@ -268,74 +282,125 @@ if (require.main === module) {
         process.exit(1);
       }
 
-      console.log(`Running batch backtest on ${symbols.length} symbols in ${mode} mode using ${modelType} model...`);
-      
-      let paramGrid = [{ conf: 65, returnThresh: 1.5 }];
+      // Calculate temporal holdout date (6 months ago from latest overall)
+      const latestTimestamp = dbInstance.db.prepare('SELECT MAX(timestamp) as max_ts FROM price_history').get().max_ts;
+      const latestDate = new Date(latestTimestamp);
+      latestDate.setMonth(latestDate.getMonth() - 6);
+      const holdoutDate = latestDate.toISOString();
+
+      // Split symbols: 70% tuning, 30% holdout
+      // Use deterministic shuffle for reproducibility
+      const shuffled = [...symbols].sort((a, b) => a.localeCompare(b));
+      const splitIdx = Math.floor(shuffled.length * 0.7);
+      const tuningSymbols = shuffled.slice(0, splitIdx);
+      const holdoutSymbols = shuffled.slice(splitIdx);
+
+      console.log(`\n* WARNING: Universe excludes delisted stocks; results are survivorship-biased *\n`);
+
       if (isSweep) {
-        paramGrid = [];
+        console.log(`Running Grid Search on ${tuningSymbols.length} tuning symbols. Time holdout active...`);
+        
+        const paramGrid = [];
         for (const conf of [55, 60, 65, 70, 75]) {
           for (const returnThresh of [1.0, 1.5, 2.0]) {
             paramGrid.push({ conf, returnThresh });
           }
         }
-        console.log(`Grid Search active: Sweeping ${paramGrid.length} combinations of hyperparameters...`);
-      }
 
-      const gridResults = [];
+        const gridResults = [];
 
-      for (const params of paramGrid) {
-        console.log(`\n=== Testing Params: Confidence > ${params.conf}, Return > ${params.returnThresh}% ===`);
-        const results = [];
-        
-        for (const sym of symbols) {
-          const res = await engine.runWalkForwardBacktest(sym, 100000, mode, modelType, params);
-          if (res) {
-            results.push(res);
-            // Persist to database
-            dbInstance.saveBacktestRun({
-              symbol: res.symbol,
-              mode,
-              model_type: modelType,
-              initial_capital: res.initialCapital,
-              final_capital: res.finalCapital,
-              total_return_pct: parseFloat(res.totalReturnPct),
-              benchmark_return_pct: parseFloat(res.benchmarkReturnPct),
-              sharpe_ratio: parseFloat(res.sharpeRatio),
-              max_drawdown_pct: parseFloat(res.maxDrawdownPct),
-              win_rate_pct: parseFloat(res.winRatePct),
-              total_trades: res.totalTrades,
-              hyperparameters: JSON.stringify(params)
+        for (const params of paramGrid) {
+          console.log(`\n=== Tuning Params: Confidence > ${params.conf}, Return > ${params.returnThresh}% ===`);
+          const results = [];
+          
+          for (const sym of tuningSymbols) {
+            const res = await engine.runWalkForwardBacktest(sym, 100000, mode, modelType, params, 'tuning', holdoutDate);
+            if (res) {
+              results.push(res);
+              dbInstance.saveBacktestRun({
+                symbol: res.symbol,
+                mode, model_type: modelType, initial_capital: res.initialCapital, final_capital: res.finalCapital,
+                total_return_pct: parseFloat(res.totalReturnPct), benchmark_return_pct: parseFloat(res.benchmarkReturnPct),
+                sharpe_ratio: parseFloat(res.sharpeRatio), max_drawdown_pct: parseFloat(res.maxDrawdownPct),
+                win_rate_pct: parseFloat(res.winRatePct), total_trades: res.totalTrades, hyperparameters: JSON.stringify(params),
+                holdout_type: 'tuning', is_survivorship_biased: 1
+              });
+            }
+          }
+          
+          if (results.length > 0) {
+            const avgSharpe = results.reduce((acc, r) => acc + parseFloat(r.sharpeRatio), 0) / results.length;
+            const avgReturn = results.reduce((acc, r) => acc + parseFloat(r.totalReturnPct), 0) / results.length;
+            gridResults.push({
+              conf: params.conf, returnThresh: params.returnThresh,
+              avgSharpe: parseFloat(avgSharpe.toFixed(2)), avgReturn: parseFloat(avgReturn.toFixed(2)),
+              totalTrades: results.reduce((acc, r) => acc + r.totalTrades, 0)
             });
           }
         }
-        
-        if (results.length > 0) {
-          const avgSharpe = results.reduce((acc, r) => acc + parseFloat(r.sharpeRatio), 0) / results.length;
-          const avgReturn = results.reduce((acc, r) => acc + parseFloat(r.totalReturnPct), 0) / results.length;
-          gridResults.push({
-            conf: params.conf,
-            returnThresh: params.returnThresh,
-            avgSharpe: avgSharpe.toFixed(2),
-            avgReturn: avgReturn.toFixed(2),
-            totalTrades: results.reduce((acc, r) => acc + r.totalTrades, 0)
-          });
-        }
-      }
 
-      if (isSweep) {
-        console.log('\n=== GRID SEARCH RESULTS ===');
-        gridResults.sort((a, b) => parseFloat(b.avgSharpe) - parseFloat(a.avgSharpe)); // Sort by Sharpe descending
+        console.log('\n=== TUNING RESULTS ===');
+        gridResults.sort((a, b) => b.avgSharpe - a.avgSharpe); 
         console.table(gridResults);
-        console.log(`\nBest Parameters: Confidence ${gridResults[0].conf}, Return Thresh ${gridResults[0].returnThresh}%`);
+
+        const bestParams = gridResults[0];
+        console.log(`\n🏆 Best Parameters: Confidence ${bestParams.conf}, Return Thresh ${bestParams.returnThresh}%`);
+        console.log(`\nEvaluating Best Parameters on HOLDOUT Set (${holdoutSymbols.length} stocks, last 6 months)...`);
+
+        const holdoutResults = [];
+        for (const sym of holdoutSymbols) {
+          const res = await engine.runWalkForwardBacktest(sym, 100000, mode, modelType, bestParams, 'holdout', holdoutDate);
+          if (res) {
+            holdoutResults.push(res);
+            dbInstance.saveBacktestRun({
+              symbol: res.symbol,
+              mode, model_type: modelType, initial_capital: res.initialCapital, final_capital: res.finalCapital,
+              total_return_pct: parseFloat(res.totalReturnPct), benchmark_return_pct: parseFloat(res.benchmarkReturnPct),
+              sharpe_ratio: parseFloat(res.sharpeRatio), max_drawdown_pct: parseFloat(res.maxDrawdownPct),
+              win_rate_pct: parseFloat(res.winRatePct), total_trades: res.totalTrades, hyperparameters: JSON.stringify(bestParams),
+              holdout_type: 'holdout', is_survivorship_biased: 1
+            });
+          }
+        }
+
+        const holdoutSharpe = holdoutResults.length > 0 ? (holdoutResults.reduce((acc, r) => acc + parseFloat(r.sharpeRatio), 0) / holdoutResults.length) : 0;
+        
+        console.log(`\n=== OVERFITTING CHECK ===`);
+        console.log(`Tuning Sharpe: ${bestParams.avgSharpe.toFixed(2)} | Holdout Sharpe: ${holdoutSharpe.toFixed(2)}`);
+        
+        if (bestParams.avgSharpe > 0 && holdoutSharpe < bestParams.avgSharpe) {
+          const dropPct = ((bestParams.avgSharpe - holdoutSharpe) / bestParams.avgSharpe) * 100;
+          console.log(`Performance Drop: ${dropPct.toFixed(2)}%`);
+          if (dropPct > 35) {
+            console.log(`🚨 OVERFIT DETECTED! Holdout Sharpe dropped > 35%. Do not deploy these parameters.`);
+          } else {
+            console.log(`✅ Parameters validated. Performance drop is within acceptable variance.`);
+          }
+        } else {
+          console.log(`✅ Parameters validated. Holdout performed well.`);
+        }
+
       } else {
-        console.log('\n=== FINAL BATCH RESULTS ===');
-        // Calculate averages for standard run
-        // (Just display individual for non-sweep, but we can do whatever)
-        console.log(`Average Sharpe: ${gridResults[0].avgSharpe}`);
+        console.log(`Running batch backtest on ${symbols.length} symbols in ${mode} mode using ${modelType} model...`);
+        console.log(`\n* WARNING: Universe excludes delisted stocks; results are survivorship-biased *\n`);
+        const params = { conf: 65, returnThresh: 1.5 };
+        for (const sym of symbols) {
+          const res = await engine.runWalkForwardBacktest(sym, 100000, mode, modelType, params);
+          if (res) {
+            dbInstance.saveBacktestRun({
+                symbol: res.symbol, mode, model_type: modelType, initial_capital: res.initialCapital, final_capital: res.finalCapital,
+                total_return_pct: parseFloat(res.totalReturnPct), benchmark_return_pct: parseFloat(res.benchmarkReturnPct),
+                sharpe_ratio: parseFloat(res.sharpeRatio), max_drawdown_pct: parseFloat(res.maxDrawdownPct),
+                win_rate_pct: parseFloat(res.winRatePct), total_trades: res.totalTrades, hyperparameters: JSON.stringify(params),
+                holdout_type: 'none', is_survivorship_biased: 1
+            });
+          }
+        }
       }
 
       process.exit(0);
     } else {
+      console.log(`\n* WARNING: Universe excludes delisted stocks; results are survivorship-biased *\n`);
       const res = await engine.runWalkForwardBacktest(symbolArg, 100000, mode, modelType, { conf: 65, returnThresh: 1.5 });
       if (res) {
         dbInstance.saveBacktestRun({
@@ -350,7 +415,8 @@ if (require.main === module) {
             max_drawdown_pct: parseFloat(res.maxDrawdownPct),
             win_rate_pct: parseFloat(res.winRatePct),
             total_trades: res.totalTrades,
-            hyperparameters: JSON.stringify({ conf: 65, returnThresh: 1.5 })
+            hyperparameters: JSON.stringify({ conf: 65, returnThresh: 1.5 }),
+            holdout_type: 'none', is_survivorship_biased: 1
         });
       }
       process.exit(0);

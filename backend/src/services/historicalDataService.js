@@ -91,31 +91,36 @@ class HistoricalDataService {
     startDate.setFullYear(startDate.getFullYear() - years);
     
     try {
-      // Use chart API for historical data
-      const result = await yahooFinance.chart(yahooSymbol, {
+      // Use historical API for data (it includes adjClose)
+      const result = await yahooFinance.historical(yahooSymbol, {
         period1: startDate.toISOString().split('T')[0],
         period2: new Date().toISOString().split('T')[0],
         interval: '1d'
       });
 
-      if (!result || !result.quotes || result.quotes.length === 0) {
+      if (!result || result.length === 0) {
         console.warn(`No historical data found for ${symbol}`);
         return { success: false, symbol, error: 'No data found' };
       }
 
-      // Transform and store in database
-      const records = result.quotes
+      // Transform and store in database using adjClose
+      // Note: adjclose adjustment factors change retroactively as new dividends/splits occur, 
+      // meaning identical date ranges can produce different numbers run-to-run.
+      const records = result
         .filter(quote => quote.close != null)
-        .map(quote => ({
-          symbol: symbol.toUpperCase(),
-          timestamp: new Date(quote.date).toISOString(),
-          open: quote.open || quote.close,
-          high: quote.high || quote.close,
-          low: quote.low || quote.close,
-          close: quote.close,
-          volume: quote.volume || 0,
-          timeframe: '1d'
-        }));
+        .map(quote => {
+          const adjRatio = quote.adjClose && quote.close ? quote.adjClose / quote.close : 1;
+          return {
+            symbol: symbol.toUpperCase(),
+            timestamp: new Date(quote.date).toISOString(),
+            open: (quote.open || quote.close) * adjRatio,
+            high: (quote.high || quote.close) * adjRatio,
+            low: (quote.low || quote.close) * adjRatio,
+            close: quote.adjClose || quote.close,
+            volume: quote.volume || 0,
+            timeframe: '1d'
+          };
+        });
 
       if (records.length > 0) {
         this.db.bulkInsertPriceHistory(records);
@@ -133,6 +138,65 @@ class HistoricalDataService {
     } catch (error) {
       console.error(`❌ Error fetching historical data for ${symbol}:`, error.message);
       return { success: false, symbol, error: error.message };
+    }
+  }
+
+  /**
+   * Fetch historical indices data (NIFTY 50, INDIAVIX)
+   */
+  async fetchAndStoreIndicesHistory(years = 15) {
+    console.log(`📊 Fetching indices history (^NSEI, ^INDIAVIX)...`);
+    const indices = ['^NSEI', '^INDIAVIX'];
+    
+    const startDate = new Date();
+    startDate.setFullYear(startDate.getFullYear() - years);
+
+    for (const indexSymbol of indices) {
+      try {
+        const result = await yahooFinance.historical(indexSymbol, {
+          period1: startDate.toISOString().split('T')[0],
+          period2: new Date().toISOString().split('T')[0],
+          interval: '1d'
+        });
+
+        if (result && result.length > 0) {
+          const records = result
+            .filter(quote => quote.close != null)
+            .map(quote => ({
+              symbol: indexSymbol === '^NSEI' ? 'NIFTY50' : 'INDIAVIX',
+              timestamp: new Date(quote.date).toISOString(),
+              open: quote.open || quote.close,
+              high: quote.high || quote.close,
+              low: quote.low || quote.close,
+              close: quote.close, // Indices typically don't have adjClose adjustments like stocks
+              volume: quote.volume || 0
+            }));
+          
+          this.db.saveIndexHistory(records[0].symbol, records);
+          console.log(`✅ Stored ${records.length} records for ${indexSymbol}`);
+        }
+      } catch (err) {
+        console.error(`❌ Error fetching ${indexSymbol}:`, err.message);
+      }
+    }
+  }
+
+  /**
+   * Fetch Earnings Calendar Date
+   */
+  async fetchEarningsDate(symbol) {
+    try {
+      const yahooSymbol = this.getYahooSymbol(symbol);
+      const quote = await yahooFinance.quote(yahooSymbol);
+      if (quote && quote.earningsTimestamp) {
+        return { symbol, earningsDate: new Date(quote.earningsTimestamp).toISOString(), is_mocked: false };
+      }
+      return { symbol, earningsDate: null, is_mocked: false };
+    } catch (err) {
+      // Mock it if API fails to prevent blocking
+      const mockDate = new Date();
+      mockDate.setDate(mockDate.getDate() + Math.floor(Math.random() * 60)); // Random day in next 2 months
+      return { symbol, earningsDate: mockDate.toISOString(), is_mocked: true };
     }
   }
 
@@ -396,6 +460,9 @@ class HistoricalDataService {
   }
 
   async preloadAllStocks(scripList, progressCallback) {
+    // First fetch index history
+    await this.fetchAndStoreIndicesHistory(15);
+    
     const total = scripList.length;
     let completed = 0;
     let succeeded = 0;
