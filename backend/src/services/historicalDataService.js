@@ -278,10 +278,8 @@ class HistoricalDataService {
       }
       return { symbol, earningsDate: null, is_mocked: false };
     } catch (err) {
-      // Mock it if API fails to prevent blocking
-      const mockDate = new Date();
-      mockDate.setDate(mockDate.getDate() + Math.floor(Math.random() * 60)); // Random day in next 2 months
-      return { symbol, earningsDate: mockDate.toISOString(), is_mocked: true };
+      // Don't fabricate data. Return null if we can't find it.
+      return { symbol, earningsDate: null, is_mocked: false };
     }
   }
 

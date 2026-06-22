@@ -18,8 +18,8 @@ os.makedirs(MODELS_DIR, exist_ok=True)
 
 import re
 
-def get_global_model_path() -> str:
-    return os.path.join(MODELS_DIR, "global_xgb.pkl")
+def get_global_model_path(model_type: str = 'full') -> str:
+    return os.path.join(MODELS_DIR, f"global_xgb_{model_type}.pkl")
 
 def fetch_all_symbols():
     conn = sqlite3.connect(DB_PATH)
@@ -30,14 +30,23 @@ def fetch_all_symbols():
     return df['symbol'].tolist()
 
 # Helper to fetch data
-def fetch_data(symbol: str):
+def fetch_data(symbol: str, cutoff_date: str = None):
     conn = sqlite3.connect(DB_PATH)
     query = "SELECT * FROM price_history WHERE symbol = ? ORDER BY timestamp ASC"
     df = pd.read_sql_query(query, conn, params=(symbol,))
+    
+    if cutoff_date:
+        df = df[df['timestamp'] <= cutoff_date]
+        
+    cursor = conn.cursor()
+    cursor.execute("SELECT next_earnings_date FROM stocks WHERE symbol=?", (symbol,))
+    row = cursor.fetchone()
+    next_earnings_date = row[0] if row else None
+    
     conn.close()
-    return df
+    return df, next_earnings_date
 
-def create_features(df, symbol, feature_version='v1'):
+def create_features(df, symbol, feature_version='v1', next_earnings_date=None):
     if df.empty or len(df) < 60:
         return df
 
@@ -69,7 +78,21 @@ def create_features(df, symbol, feature_version='v1'):
 
     df[['pe_ratio', 'pb_ratio', 'roe', 'debt_eq']] = df[['pe_ratio', 'pb_ratio', 'roe', 'debt_eq']].fillna(0)
 
-    base_features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+    # Earnings Features
+    if next_earnings_date:
+        try:
+            df['has_earnings_data'] = 1
+            ts = pd.to_datetime(df['timestamp'], utc=True).dt.tz_localize(None)
+            ned = pd.to_datetime(next_earnings_date, utc=True).tz_localize(None)
+            df['days_to_earnings'] = (ned - ts).dt.days
+        except Exception:
+            df['has_earnings_data'] = 0
+            df['days_to_earnings'] = 999
+    else:
+        df['has_earnings_data'] = 0
+        df['days_to_earnings'] = 999
+
+    base_features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq', 'has_earnings_data', 'days_to_earnings']
 
     if feature_version == 'v2':
         # Volatility Regime
@@ -138,16 +161,16 @@ def create_features(df, symbol, feature_version='v1'):
     return df
 
 @app.post("/train_global")
-def train_global_model(feature_version: str = 'v2'):
+def train_global_model(cutoff_date: str = None, model_type: str = 'full', feature_version: str = 'v2'):
     symbols = fetch_all_symbols()
     dfs = []
     
     # Fetch data and create features for all symbols
     for sym in symbols:
         try:
-            df = fetch_data(sym)
+            df, next_earnings_date = fetch_data(sym, cutoff_date)
             if len(df) >= 100:
-                df = create_features(df, sym, feature_version)
+                df = create_features(df, sym, feature_version, next_earnings_date)
                 if not df.empty:
                     dfs.append(df)
         except Exception as e:
@@ -168,15 +191,24 @@ def train_global_model(feature_version: str = 'v2'):
             break
             
     if not features:
-        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq', 'has_earnings_data', 'days_to_earnings']
         
     X = master_df[features]
     y = (master_df['target'] > 0.01).astype(int)
     
-    # Time series split (last 20% for validation)
-    split_idx = int(len(X) * 0.8)
-    X_train, X_val = X.iloc[:split_idx], X.iloc[split_idx:]
-    y_train, y_val = y.iloc[:split_idx], y.iloc[split_idx:]
+    # Time series split with 10-day purging
+    split_idx = int(len(master_df) * 0.8)
+    split_dt = master_df.iloc[split_idx]['timestamp_dt']
+    from datetime import timedelta
+    train_end = split_dt - timedelta(days=10)
+    
+    train_mask = master_df['timestamp_dt'] <= train_end
+    val_mask = master_df['timestamp_dt'] >= split_dt
+    
+    X_train = X[train_mask]
+    y_train = y[train_mask]
+    X_val = X[val_mask]
+    y_val = y[val_mask]
     
     model = xgb.XGBClassifier(
         n_estimators=100, 
@@ -188,7 +220,7 @@ def train_global_model(feature_version: str = 'v2'):
     
     model.fit(X_train, y_train, eval_set=[(X_val, y_val)], verbose=False)
     
-    model_path = get_global_model_path()
+    model_path = get_global_model_path(model_type)
     joblib.dump({'model': model, 'feature_version': feature_version, 'features': features}, model_path)
     
     return {"message": f"Successfully trained global XGBoost model using {feature_version}"}
@@ -201,26 +233,22 @@ class PredictRequest(BaseModel):
 
 
 @app.post("/predict/{symbol}")
-def predict(symbol: str, req: PredictRequest):
-    model_path = get_global_model_path()
+def predict(symbol: str, req: PredictRequest, model_type: str = 'full'):
+    model_path = get_global_model_path(model_type)
     if not os.path.exists(model_path):
-        # Trigger train if missing
-        train_global_model()
-        
-    if not os.path.exists(model_path):
-        raise HTTPException(status_code=500, detail="Model could not be trained")
+        raise HTTPException(status_code=404, detail="Model file not found")
         
     loaded = joblib.load(model_path)
     if isinstance(loaded, dict) and 'model' in loaded:
         model = loaded['model']
         feature_version = loaded.get('feature_version', 'v1')
-        features = loaded.get('features', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq'])
+        features = loaded.get('features', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq', 'has_earnings_data', 'days_to_earnings'])
     else:
         model = loaded
         feature_version = 'v1'
-        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq', 'has_earnings_data', 'days_to_earnings']
     
-    df = fetch_data(symbol)
+    df, next_earnings_date = fetch_data(symbol)
     if df.empty:
         raise HTTPException(status_code=404, detail="No historical data found")
         
@@ -236,7 +264,7 @@ def predict(symbol: str, req: PredictRequest):
     }])
     
     df = pd.concat([df, new_row], ignore_index=True)
-    df = create_features(df, symbol, feature_version)
+    df = create_features(df, symbol, feature_version, next_earnings_date)
     
     if df.empty:
         raise HTTPException(status_code=400, detail="Insufficient data for feature engineering")
@@ -259,33 +287,30 @@ def predict(symbol: str, req: PredictRequest):
     }
 
 @app.get("/historical_predict/{symbol}")
-def historical_predict(symbol: str):
+def historical_predict(symbol: str, model_type: str = 'full'):
     """
     Bulk prediction for walk-forward backtesting.
     Returns the XGBoost signals for all historical dates for a symbol.
     """
-    model_path = get_global_model_path()
+    model_path = get_global_model_path(model_type)
     if not os.path.exists(model_path):
-        train_global_model()
-        
-    if not os.path.exists(model_path):
-        raise HTTPException(status_code=500, detail="Model could not be trained")
+        raise HTTPException(status_code=404, detail="Model file not found")
         
     loaded = joblib.load(model_path)
     if isinstance(loaded, dict) and 'model' in loaded:
         model = loaded['model']
         feature_version = loaded.get('feature_version', 'v1')
-        features = loaded.get('features', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq'])
+        features = loaded.get('features', ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq', 'has_earnings_data', 'days_to_earnings'])
     else:
         model = loaded
         feature_version = 'v1'
-        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq', 'has_earnings_data', 'days_to_earnings']
     
-    df = fetch_data(symbol)
+    df, next_earnings_date = fetch_data(symbol)
     if df.empty:
         raise HTTPException(status_code=404, detail="No historical data found")
         
-    df = create_features(df, symbol, feature_version)
+    df = create_features(df, symbol, feature_version, next_earnings_date)
     if df.empty:
         raise HTTPException(status_code=400, detail="Insufficient data")
         
@@ -312,13 +337,10 @@ def historical_predict(symbol: str):
     return results
 
 @app.get("/explain/{symbol}")
-def explain(symbol: str):
-    model_path = get_global_model_path()
+def explain(symbol: str, model_type: str = 'full'):
+    model_path = get_global_model_path(model_type)
     if not os.path.exists(model_path):
-        train_global_model()
-        
-    if not os.path.exists(model_path):
-        raise HTTPException(status_code=500, detail="Model could not be trained")
+        raise HTTPException(status_code=404, detail="Model file not found")
         
     loaded = joblib.load(model_path)
     if isinstance(loaded, dict) and 'model' in loaded:
@@ -331,13 +353,13 @@ def explain(symbol: str):
         features = []
         
     if not features:
-        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq']
+        features = ['ret_1d', 'ret_5d', 'ret_10d', 'vol_10d', 'dist_sma_20', 'range', 'pe_ratio', 'pb_ratio', 'roe', 'debt_eq', 'has_earnings_data', 'days_to_earnings']
         
-    df = fetch_data(symbol)
+    df, next_earnings_date = fetch_data(symbol)
     if df.empty:
         raise HTTPException(status_code=404, detail="No historical data found")
         
-    df = create_features(df, symbol, feature_version)
+    df = create_features(df, symbol, feature_version, next_earnings_date)
     if df.empty:
         raise HTTPException(status_code=400, detail="Insufficient data for feature engineering")
         

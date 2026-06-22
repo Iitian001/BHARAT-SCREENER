@@ -63,8 +63,36 @@ async function runForwardPaperTrades() {
     }
   }
   
+  // 5. Check global win rate over the last 50 resolved trades
+  checkGlobalWinRateAndKillSwitch();
+  
   console.log("Forward paper trading log complete.");
 }
+
+function checkGlobalWinRateAndKillSwitch() {
+  const recentTrades = dbInstance.db.prepare(`
+    SELECT status FROM paper_trades 
+    WHERE status IN ('WIN', 'LOSS') 
+    ORDER BY resolved_at DESC LIMIT 50
+  `).all();
+  
+  if (recentTrades.length < 10) return; // Not enough data
+  
+  const wins = recentTrades.filter(t => t.status === 'WIN').length;
+  const winRate = wins / recentTrades.length;
+  console.log(`[Risk Check] Recent Win Rate: ${(winRate * 100).toFixed(2)}% (${wins}/${recentTrades.length})`);
+  
+  if (winRate < 0.30) {
+    console.error('🚨 [CRITICAL RISK] Win rate dropped below 30%. Triggering Automated Kill Switch.');
+    const reason = `Automated Halt: Recent win rate is ${(winRate * 100).toFixed(2)}%`;
+    try {
+      dbInstance.db.prepare('INSERT INTO kill_switch_audit (reason, action) VALUES (?, ?)').run(reason, 'HALT');
+    } catch (e) {
+      console.error('Failed to write to kill_switch_audit:', e.message);
+    }
+  }
+}
+
 
 function resolveOldTrades(symbol) {
   // Find open trades older than 5 days
@@ -83,15 +111,17 @@ function resolveOldTrades(symbol) {
   
   const resolveStmt = dbInstance.db.prepare(`
     UPDATE paper_trades 
-    SET status = 'RESOLVED', actual_outcome_price = ?, resolved_at = datetime('now')
+    SET status = ?, actual_outcome_price = ?, realized_return = ?, resolved_at = datetime('now')
     WHERE id = ?
   `);
   
   for (const trade of openTrades) {
-    resolveStmt.run(currentPrice, trade.id);
     const returnPct = ((currentPrice - trade.price) / trade.price) * 100;
     const isWin = (trade.action === 'BUY' && returnPct > 0) || (trade.action === 'SELL' && returnPct < 0);
-    console.log(`[Paper Trade Resolved] ${symbol} ${trade.action} @ ${trade.price} -> ${currentPrice} | Return: ${returnPct.toFixed(2)}% | ${isWin ? '✅ WIN' : '❌ LOSS'}`);
+    const newStatus = isWin ? 'WIN' : 'LOSS';
+    
+    resolveStmt.run(newStatus, currentPrice, returnPct, trade.id);
+    console.log(`[Paper Trade Resolved] ${symbol} ${trade.action} @ ${trade.price} -> ${currentPrice} | Return: ${returnPct.toFixed(2)}% | ${newStatus}`);
   }
 }
 

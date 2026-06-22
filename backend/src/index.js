@@ -73,11 +73,100 @@ app.use('/api', (req, res, next) => {
 
 // Kill Switch Check Middleware
 let killSwitchTriggered = false;
+
+// Sync kill switch state with DB
+setInterval(() => {
+  try {
+    const db = getDatabase().db;
+    const lastAction = db.prepare('SELECT action FROM kill_switch_audit ORDER BY id DESC LIMIT 1').get();
+    if (lastAction && lastAction.action === 'HALT') {
+      killSwitchTriggered = true;
+    } else {
+      killSwitchTriggered = false;
+    }
+  } catch (err) {}
+}, 5000);
+
 app.use('/api', (req, res, next) => {
   if (killSwitchTriggered && (req.path.includes('/prediction') || req.path.includes('/portfolio'))) {
     return res.status(503).json({ error: 'SYSTEM HALTED: Risk Kill Switch is Active.' });
   }
   next();
+});
+
+// Admin Kill Switch Endpoints
+app.post('/api/admin/halt', (req, res) => {
+  try {
+    const db = getDatabase().db;
+    const reason = req.body.reason || 'Manual Admin Halt';
+    db.prepare('INSERT INTO kill_switch_audit (reason, action) VALUES (?, ?)').run(reason, 'HALT');
+    killSwitchTriggered = true;
+    res.json({ success: true, message: 'System Halted' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/admin/resume', (req, res) => {
+  try {
+    const db = getDatabase().db;
+    const reason = req.body.reason || 'Manual Admin Resume';
+    db.prepare('INSERT INTO kill_switch_audit (reason, action) VALUES (?, ?)').run(reason, 'RESUME');
+    killSwitchTriggered = false;
+    res.json({ success: true, message: 'System Resumed' });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Data Health & Rejections Endpoints
+app.get('/api/data/health', (req, res) => {
+  res.json({ success: true, message: 'Data is being sanitized. Exact gaps per symbol not fully implemented yet in UI.' });
+});
+
+app.get('/api/portfolio/rejections', (req, res) => {
+  try {
+    const db = getDatabase().db;
+    const rows = db.prepare('SELECT * FROM portfolio_rejections ORDER BY timestamp DESC LIMIT 100').all();
+    res.json({ success: true, data: rows });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// Live Forward Tracking Dashboard
+app.get('/api/tracking/dashboard', (req, res) => {
+  try {
+    const db = getDatabase().db;
+    
+    // Live Win Rate
+    const liveStats = db.prepare(`
+      SELECT 
+        COUNT(*) as total_resolved,
+        SUM(CASE WHEN status = 'WIN' THEN 1 ELSE 0 END) as wins
+      FROM paper_trades WHERE status IN ('WIN', 'LOSS')
+    `).get();
+    
+    // Backtest Average Return (Proxy for backtest success if no direct win rate stored)
+    const backtestStats = db.prepare(`
+      SELECT 
+        COUNT(*) as runs,
+        AVG(return_pct) as avg_return,
+        AVG(max_drawdown) as avg_max_drawdown
+      FROM portfolio_backtests
+    `).get();
+    
+    res.json({
+      success: true,
+      liveWinRate: liveStats.total_resolved > 0 ? (liveStats.wins / liveStats.total_resolved) * 100 : 0,
+      liveTotalResolved: liveStats.total_resolved,
+      backtestRuns: backtestStats.runs,
+      backtestAvgReturn: backtestStats.avg_return,
+      backtestAvgDrawdown: backtestStats.avg_max_drawdown
+    });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
 });
 
 // ─── Scheduled Tasks (Cron) ─────────────────────────────────────────────────
@@ -485,8 +574,6 @@ async function startup() {
 
     if (!histService) histService = new HistoricalDataService();
 
-    // RUN IN BACKGROUND DISABLED TO PREVENT RATE LIMITING ON REAL-TIME DATA
-    /*
     histService.preloadAllStocks(cleanSymbols, (progress) => {
       preloadStatus.completed = progress.completed;
       preloadStatus.succeeded = progress.succeeded;
@@ -504,7 +591,6 @@ async function startup() {
       preloadStatus.running = false;
       console.error('❌ Pre-load error:', err.message);
     });
-    */
   } catch (err) {
     console.error('⚠️  Pre-loader init failed:', err.message);
   }

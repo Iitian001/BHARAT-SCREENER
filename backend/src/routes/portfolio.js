@@ -170,8 +170,11 @@ router.post('/generate', async (req, res) => {
     // Global ranking: Sharpe contribution (Expected Return / Volatility)
     topCandidates.sort((a, b) => (b.expectedReturn / (b.volatility || 0.01)) - (a.expectedReturn / (a.volatility || 0.01)));
 
+    const maxPosBudget = budget * 0.20; // Hard 20% max position cap
+    const minCashRequirement = budget * 0.20; // Hard 20% minimum cash
+
     for (const stock of topCandidates) {
-      if (remainingBudget <= 100) break; // Minimum budget threshold
+      if (remainingBudget <= minCashRequirement + 100) break; // Keep 20% cash uninvested
 
       // Correlation Check (> 0.7 reject)
       let tooCorrelated = false;
@@ -214,7 +217,7 @@ router.post('/generate', async (req, res) => {
         if (isNaN(kellyFraction)) kellyFraction = 0.01;
         
         const targetAllocation = budget * kellyFraction;
-        let actualAllocation = Math.min(targetAllocation, remainingBudget);
+        let actualAllocation = Math.min(targetAllocation, maxPosBudget, remainingBudget - minCashRequirement);
         
         // Reduce allocation if it breaches sector cap
         if (currentSectorAlloc + actualAllocation > maxSectorBudget) {

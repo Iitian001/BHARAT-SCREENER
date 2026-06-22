@@ -80,6 +80,7 @@ class DatabaseService {
         quantity INTEGER NOT NULL,
         status TEXT DEFAULT 'OPEN',
         actual_outcome_price REAL,
+        realized_return REAL,
         resolved_at DATETIME,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
       )
@@ -273,13 +274,37 @@ class DatabaseService {
       CREATE INDEX IF NOT EXISTS idx_predictions_symbol ON predictions(symbol);
     `);
 
-    // Portfolio rejections table
+    // Portfolio Rejections Logging Table
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS portfolio_rejections (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         symbol TEXT NOT NULL,
         reason TEXT NOT NULL,
         timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+      )
+    `);
+
+    // Kill Switch Audit Log
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS kill_switch_audit (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        reason TEXT NOT NULL,
+        action TEXT NOT NULL
+      )
+    `);
+
+    // Portfolio Backtest Runs
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS portfolio_backtests (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
+        start_date TEXT,
+        end_date TEXT,
+        starting_budget REAL,
+        final_value REAL,
+        return_pct REAL,
+        max_drawdown REAL
       )
     `);
   }
