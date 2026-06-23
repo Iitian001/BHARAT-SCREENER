@@ -2,7 +2,7 @@ const express = require('express');
 const router = express.Router();
 const HistoricalDataService = require('../services/historicalDataService');
 const TechnicalIndicators = require('../ml/technicalIndicators');
-const mlModel = require('../ml/mlModel');
+const dbService = require('../services/database');
 const dbService = require('../services/database');
 
 function calculateReturnCorrelation(hist1, hist2, days = 60) {
@@ -120,43 +120,59 @@ router.post('/generate', async (req, res) => {
       filtered = filtered.sort((a, b) => (b.expectedReturn / (b.volatility || 0.01)) - (a.expectedReturn / (a.volatility || 0.01)));
     }
 
-    console.log(`[Portfolio] ${filtered.length} stocks passed filters. Running Deep Learning on top 10...`);
+    console.log(`[Portfolio] ${filtered.length} stocks passed filters. Running Python XGBoost on top 50...`);
 
-    // PHASE 4: HEAVY AI — Train LSTM on top 10 candidates for maximum accuracy
-    const topCandidates = filtered.slice(0, 10);
+    // PHASE 4: Global XGBoost Inference
+    const topCandidates = filtered.slice(0, 50);
     
     for (const stock of topCandidates) {
       try {
-        let cachedModel = mlModel.models.get(stock.symbol);
-        if (!cachedModel || (Date.now() - cachedModel.lastTrained > 24 * 60 * 60 * 1000)) {
-           await mlModel.trainModelForSymbol(stock.symbol, stock.historicalData);
-        }
-        const prediction = await mlModel.predictAsync({ 
-          historicalData: stock.historicalData, 
-          currentData: stock.currentData, 
-          symbol: stock.symbol 
+        const response = await fetch(`http://127.0.0.1:5001/predict?model_type=full`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            symbol: stock.symbol,
+            features: {
+              rsi14: TechnicalIndicators.calculateRSI(stock.historicalData, 14),
+              macd: TechnicalIndicators.calculateMACD(stock.historicalData).histogram,
+              volatility: stock.volatility,
+              volume_zscore: 0, // Placeholder
+              pe_ratio: 15,
+              days_to_earnings: 999
+            }
+          })
         });
         
-        if (prediction.targetPrice && prediction.targetPrice > stock.price) {
-           stock.targetPrice = prediction.targetPrice;
-           stock.expectedReturn = ((prediction.targetPrice - stock.price) / stock.price) * 100;
-           if (prediction.confidence > 60) stock.confidence += 10;
+        if (response.ok) {
+          const prediction = await response.json();
+          if (prediction.status === 'success' && prediction.predicted_return > 0) {
+             stock.expectedReturn = prediction.predicted_return * 100;
+             stock.targetPrice = stock.price * (1 + prediction.predicted_return);
+             stock.confidence = 75 + (prediction.predicted_return * 100);
+          } else {
+             // If prediction is negative, penalize it
+             stock.expectedReturn = -1;
+          }
         }
       } catch (e) {
-        console.warn(`[Portfolio DL Pass] Error predicting ${stock.symbol}:`, e.message);
+        console.warn(`[Portfolio Python Pass] Error predicting ${stock.symbol}:`, e.message);
       }
     }
+    
+    // Filter out negative predictions
+    let finalCandidates = topCandidates.filter(s => s.expectedReturn > 0);
 
     // Re-sort after AI evaluation
+    // Re-sort after AI evaluation
     if (risk === 'Low') {
-      topCandidates.sort((a, b) => b.confidence - a.confidence);
+      finalCandidates.sort((a, b) => b.confidence - a.confidence);
     } else if (risk === 'High') {
-      topCandidates.sort((a, b) => b.expectedReturn - a.expectedReturn);
+      finalCandidates.sort((a, b) => b.expectedReturn - a.expectedReturn);
     } else {
-      topCandidates.sort((a, b) => (b.expectedReturn / (b.volatility || 0.01)) - (a.expectedReturn / (a.volatility || 0.01)));
+      finalCandidates.sort((a, b) => (b.expectedReturn / (b.volatility || 0.01)) - (a.expectedReturn / (a.volatility || 0.01)));
     }
 
-    // PHASE 5: Allocate Budget Using Kelly Criterion, Sector Caps, and Correlation check
+    // PHASE 5: Allocate Budget Using Scaled Weights, Sector Caps, and Correlation check
     const portfolio = [];
     let remainingBudget = budget;
     let totalExpectedProfit = 0;
@@ -166,15 +182,34 @@ router.post('/generate', async (req, res) => {
     const maxSectorBudget = budget * (sectorCapPct / 100);
     const sectorAllocations = {};
     const selectedStocks = [];
-    
-    // Global ranking: Sharpe contribution (Expected Return / Volatility)
-    topCandidates.sort((a, b) => (b.expectedReturn / (b.volatility || 0.01)) - (a.expectedReturn / (a.volatility || 0.01)));
 
+    // First Pass: Select uncorrelated stocks that the user can actually afford
     const maxPosBudget = budget * 0.20; // Hard 20% max position cap
-    const minCashRequirement = budget * 0.20; // Hard 20% minimum cash
+    
+    // Shuffle the finalCandidates slightly (e.g. top 20) so the user gets varied ideas 
+    // instead of the exact same deterministic list every single time.
+    const top20 = finalCandidates.slice(0, 20);
+    for (let i = top20.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [top20[i], top20[j]] = [top20[j], top20[i]];
+    }
+    // Re-sort them back partially, but keep some randomness (e.g., sort by expected return + noise)
+    top20.sort((a, b) => b.expectedReturn * (1 + (Math.random() * 0.2 - 0.1)) - a.expectedReturn * (1 + (Math.random() * 0.2 - 0.1)));
 
-    for (const stock of topCandidates) {
-      if (remainingBudget <= minCashRequirement + 100) break; // Keep 20% cash uninvested
+    for (const stock of top20) {
+      if (selectedStocks.length >= 10) break; // Max 10 stocks in portfolio
+
+      // Affordability Check: Can we buy at least 1 share within the 20% max position limit?
+      if (stock.price > maxPosBudget) {
+        dbInstance.logPortfolioRejection(stock.symbol, `Price (₹${stock.price}) exceeds max position limit (₹${maxPosBudget})`);
+        continue;
+      }
+
+      // Quality Filter: If budget is decent (> 5000), penalize extreme penny stocks (< ₹20)
+      if (budget > 5000 && stock.price < 20) {
+        dbInstance.logPortfolioRejection(stock.symbol, `Stock price too low for decent budget.`);
+        continue;
+      }
 
       // Correlation Check (> 0.7 reject)
       let tooCorrelated = false;
@@ -182,7 +217,6 @@ router.post('/generate', async (req, res) => {
         const corr = calculateReturnCorrelation(stock.historicalData, selected.historicalData, 60);
         if (corr > 0.7) {
           const reason = `High correlation (${corr.toFixed(2)}) with ${selected.symbol}`;
-          console.log(`[Portfolio] Rejecting ${stock.symbol} due to ${reason}`);
           dbInstance.logPortfolioRejection(stock.symbol, reason);
           tooCorrelated = true;
           break;
@@ -193,69 +227,100 @@ router.post('/generate', async (req, res) => {
       // Sector Cap Check
       const stockInfo = dbInstance.db.prepare('SELECT sector FROM stocks WHERE symbol = ?').get(stock.symbol);
       const sector = stockInfo && stockInfo.sector ? stockInfo.sector : 'Unknown';
-      const currentSectorAlloc = sectorAllocations[sector] || 0;
-      if (currentSectorAlloc >= maxSectorBudget) {
-        const reason = `Sector ${sector} already at ${sectorCapPct}% cap.`;
-        console.log(`[Portfolio] Rejecting ${stock.symbol}: ${reason}`);
-        dbInstance.logPortfolioRejection(stock.symbol, reason);
-        continue;
-      }
+      
+      // We will check sector budget during actual allocation, for now just record the sector
+      stock.sector = sector;
+      selectedStocks.push(stock);
+    }
 
-      let kellyFraction = 0;
-      let p, q, riskPct, rewardPct, b;
-      try {
-        p = Math.min(stock.confidence / 100, 0.95);
-        q = 1 - p;
-        riskPct = stock.volatility || 0.02;
-        rewardPct = stock.expectedReturn / 100;
-        
-        b = rewardPct / riskPct;
-        if (b > 0) kellyFraction = p - (q / b);
-        
-        // Half-Kelly
-        kellyFraction = Math.max(0.01, Math.min(kellyFraction / 2, 0.4));
-        if (isNaN(kellyFraction)) kellyFraction = 0.01;
-        
-        const targetAllocation = budget * kellyFraction;
-        let actualAllocation = Math.min(targetAllocation, maxPosBudget, remainingBudget - minCashRequirement);
-        
-        // Reduce allocation if it breaches sector cap
-        if (currentSectorAlloc + actualAllocation > maxSectorBudget) {
-          actualAllocation = maxSectorBudget - currentSectorAlloc;
+    const minCashRequirement = budget * 0.20; // Hard 20% minimum cash
+    let investableBudget = budget - minCashRequirement;
+
+    // Second Pass: Distribute investable budget proportionally by expected return
+    if (selectedStocks.length > 0) {
+      // Re-calculate total expected return ONLY for the selected stocks that passed filters
+      let totalExpectedReturn = selectedStocks.reduce((sum, s) => sum + s.expectedReturn, 0);
+      
+      let loopCount = 0;
+      // We will loop to redistribute stranded budget from stocks that hit their maxPosBudget
+      while (investableBudget > 100 && loopCount < 3) {
+        loopCount++;
+        let newlyInvested = 0;
+        let remainingStocks = [];
+
+        for (const stock of selectedStocks) {
+          if (stock.fullyAllocated) continue;
+
+          const weight = stock.expectedReturn / totalExpectedReturn;
+          let targetAllocation = investableBudget * weight;
+          
+          // Current allocation for this stock
+          let currentAlloc = stock.currentAlloc || 0;
+          
+          let actualAllocation = Math.min(targetAllocation, maxPosBudget - currentAlloc, remainingBudget - minCashRequirement);
+
+          // Reduce allocation if it breaches sector cap
+          const currentSectorAlloc = sectorAllocations[stock.sector] || 0;
+          if (currentSectorAlloc + actualAllocation > maxSectorBudget) {
+            actualAllocation = maxSectorBudget - currentSectorAlloc;
+          }
+          
+          if (actualAllocation < stock.price) {
+            stock.fullyAllocated = true;
+            continue;
+          }
+
+          const quantity = Math.floor(actualAllocation / stock.price);
+          
+          if (quantity > 0) {
+            const cost = quantity * stock.price;
+            stock.currentAlloc = currentAlloc + cost;
+            stock.quantity = (stock.quantity || 0) + quantity;
+            
+            remainingBudget -= cost;
+            investableBudget -= cost;
+            newlyInvested += cost;
+            sectorAllocations[stock.sector] = currentSectorAlloc + cost;
+          }
+
+          // If we hit the max pos cap, mark it so we don't allocate more to it
+          if (stock.currentAlloc >= maxPosBudget - stock.price) {
+            stock.fullyAllocated = true;
+          } else {
+            remainingStocks.push(stock);
+          }
         }
         
-        const quantity = Math.floor(actualAllocation / stock.price);
+        if (newlyInvested === 0 || remainingStocks.length === 0) break;
         
-        if (quantity > 0) {
-          const cost = quantity * stock.price;
-          const profit = cost * rewardPct;
+        // Recalculate total return for remaining stocks to redistribute the rest of the budget
+        totalExpectedReturn = remainingStocks.reduce((sum, s) => sum + s.expectedReturn, 0);
+      }
+
+      // Build the final portfolio array
+      for (const stock of selectedStocks) {
+        if (stock.quantity > 0) {
+          const rewardPct = stock.expectedReturn / 100;
+          const riskPct = stock.volatility || 0.02;
+          const profit = stock.currentAlloc * rewardPct;
           const trailingStopLoss = stock.price - (stock.price * riskPct * 2);
 
           portfolio.push({
             symbol: stock.symbol,
-            sector: sector,
-            allocationPercent: Math.round((cost / budget) * 100),
-            quantity: quantity,
+            sector: stock.sector,
+            allocationPercent: Math.round((stock.currentAlloc / budget) * 100),
+            quantity: stock.quantity,
             buyPrice: stock.price,
-            totalInvestment: cost,
+            totalInvestment: stock.currentAlloc,
             expectedReturnPercent: stock.expectedReturn.toFixed(2),
             targetPrice: (stock.price * (1 + rewardPct)).toFixed(2),
             stopLoss: trailingStopLoss.toFixed(2),
             estimatedProfit: profit,
-            kellyFraction: (kellyFraction * 100).toFixed(1) + '%'
+            weight: ((stock.currentAlloc / (budget - remainingBudget)) * 100).toFixed(1) + '%'
           });
           
-          remainingBudget -= cost;
           totalExpectedProfit += profit;
-          sectorAllocations[sector] = currentSectorAlloc + cost;
-          selectedStocks.push(stock);
         }
-      } catch (err) {
-        console.error(`[Portfolio] Error processing Kelly allocation for ${stock.symbol}:`, err.message);
-        dbInstance.logPortfolioRejection(stock.symbol, 'Error processing Kelly allocation');
-      }
-    }
-        console.warn(`[Portfolio] Error allocating ${stock.symbol}:`, err.message);
       }
     }
 
